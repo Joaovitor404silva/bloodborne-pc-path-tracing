@@ -34,6 +34,9 @@ moonlight and bounce light, traced shadows and reflections, water and puddle mir
 3. Run `Install Path Tracing.bat`. It finds the game folder, or asks for it.
 4. Start `Bloodborne.exe` as usual. Settings: Graphics page > Path tracing.
 
+In game, press **F9** to turn path tracing off and on and compare with the stock lighting.
+Give it about 3 seconds after each press while the exposure adjusts.
+
 The installer checks the folder is 1.9.7 and backs up the 84 files it replaces to `rt-backup`.
 It then copies the new files, including NVIDIA's DLSS Ray Reconstruction DLL, and checks
 every copied file by SHA-256.

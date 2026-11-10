@@ -20,6 +20,9 @@ INSTALL
    it asks for it (the folder with Bloodborne.exe).
 4. Start Bloodborne.exe as usual. Settings: Graphics page > Path tracing.
 
+In game, press F9 to turn path tracing off and on and compare with the stock
+lighting. Give it about 3 seconds after each press while the exposure adjusts.
+
 The installer replaces 84 files of the port (launcher, renderer and its DLLs) and adds
 NVIDIA's DLSS Ray Reconstruction DLL. The files it replaces go to "rt-backup" in the
 game folder. It checks every copied file.
