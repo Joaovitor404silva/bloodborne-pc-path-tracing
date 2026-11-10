@@ -11,7 +11,7 @@ moonlight and bounce light, traced shadows and reflections, water and puddle mir
 
 ![Cainhurst: a ghost on the stairs](docs/media/cainhurst-ghost.gif)
 
-![Cainhurst balcony: torch and moonlight shadows](docs/media/cainhurst-balcony.jpg)
+![Forbidden Woods: lantern and shrine light](docs/media/forbidden-woods.jpg)
 
 ## Download
 
