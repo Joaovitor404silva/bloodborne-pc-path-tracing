@@ -9,7 +9,8 @@ moonlight and bounce light, traced shadows and reflections, water and puddle mir
 
 ## Download
 
-Get `Bloodborne-PC-Path-Tracing-pt2.zip` from [Releases](../../releases).
+**[Download the latest release](https://github.com/Joaovitor404silva/bloodborne-pc-path-tracing/releases/latest)**
+(`Bloodborne-PC-Path-Tracing-pt2.zip`).
 
 ## Needs
 
