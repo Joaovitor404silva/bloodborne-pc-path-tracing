@@ -9,6 +9,8 @@ moonlight and bounce light, traced shadows and reflections, water and puddle mir
 
 ![Flooded street: lamp light mirrored in the water](docs/media/flooded-street.jpg)
 
+![Moonlit walk to the statues](docs/media/moonlit-walk.gif)
+
 ![Cainhurst: a ghost on the stairs](docs/media/cainhurst-ghost.gif)
 
 ![Forbidden Woods: lantern and shrine light](docs/media/forbidden-woods.jpg)
