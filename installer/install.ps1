@@ -192,6 +192,13 @@ if ($Uninstall) {
 
 # Install.
 $installed = Test-Path -LiteralPath $marker
+if ($installed) {
+    # Another version's backup holds other files: its own uninstaller has to put them back first.
+    $other = (Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json).rt_version
+    if ($other -ne $man.rt_version) {
+        Stop-Install "Path tracing $other is installed here. Run the Uninstall Path Tracing.bat of $other first, then install $($man.rt_version)."
+    }
+}
 if (-not $installed) {
     $version = (Get-Content -LiteralPath (Join-Path $Target 'bbport-files.json') -Raw | ConvertFrom-Json).version
     if ($version -ne $man.base_version) {
