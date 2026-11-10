@@ -1,0 +1,148 @@
+# Bloodborne PC path tracing mod: installs over (or removes from) a Bloodborne PC folder.
+param([switch]$Uninstall, [string]$Target)
+$ErrorActionPreference = 'Stop'
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$man = Get-Content -LiteralPath (Join-Path $here 'manifest.json') -Raw | ConvertFrom-Json
+$files = @($man.files.PSObject.Properties)
+$markerName = 'rt-installed.json'
+$backupName = 'rt-backup'
+
+function Stop-Install([string]$msg) {
+    Write-Host ''
+    Write-Host "ERROR: $msg" -ForegroundColor Red
+    exit 1
+}
+
+function Test-Port([string]$dir) {
+    return $dir -and (Test-Path -LiteralPath (Join-Path $dir 'bbport-files.json')) -and
+        (Test-Path -LiteralPath (Join-Path $dir 'bin'))
+}
+
+function Get-Sha([string]$path) {
+    return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+# Find the Bloodborne PC folder: -Target, the folder around this one, or ask.
+if (-not $Target) {
+    foreach ($c in @((Split-Path $here -Parent), $here, (Get-Location).Path)) {
+        if (Test-Port $c) { $Target = $c; break }
+    }
+}
+if (-not $Target) {
+    Add-Type -AssemblyName System.Windows.Forms
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Pick your Bloodborne PC folder (the one with Bloodborne.exe)'
+    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { Stop-Install 'No folder picked.' }
+    $Target = $dlg.SelectedPath
+}
+$Target = (Resolve-Path -LiteralPath $Target).Path
+if (-not (Test-Port $Target)) { Stop-Install "$Target is not a Bloodborne PC folder (no bbport-files.json / bin)." }
+Write-Host "Bloodborne PC folder: $Target"
+
+$running = Get-Process -Name 'bb-probe', 'Bloodborne', 'Play Bloodborne' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -and $_.Path.StartsWith($Target, [StringComparison]::OrdinalIgnoreCase) }
+if ($running) { Stop-Install 'Close the game and the launcher first.' }
+
+$marker = Join-Path $Target $markerName
+$backup = Join-Path $Target $backupName
+$ini = Join-Path $Target 'bbport.ini'
+
+# The upscaler line of bbport.ini: its value, '' when the line is missing, $null without the file.
+function Get-Upscaler {
+    if (-not (Test-Path -LiteralPath $ini)) { return $null }
+    foreach ($line in Get-Content -LiteralPath $ini) {
+        if ($line -match '^\s*upscaler\s*=\s*(.*?)\s*$') { return $Matches[1] }
+    }
+    return ''
+}
+
+# Sets the upscaler line; '' removes it.
+function Set-Upscaler([string]$value) {
+    $lines = @()
+    if (Test-Path -LiteralPath $ini) { $lines = @(Get-Content -LiteralPath $ini | Where-Object { $_ -notmatch '^\s*upscaler\s*=' }) }
+    else { $lines = @('# bbport settings (in-game menu: Insert / L3+R3)') }
+    if ($value -and $lines.Count -and $lines[0].StartsWith('#')) {
+        $lines = @($lines[0], "upscaler=$value") + @($lines | Select-Object -Skip 1)
+    } elseif ($value) {
+        $lines = @("upscaler=$value") + $lines
+    }
+    Set-Content -LiteralPath $ini -Value $lines -Encoding ASCII
+}
+
+if ($Uninstall) {
+    if (-not (Test-Path -LiteralPath $marker)) { Stop-Install 'Path tracing is not installed in this folder.' }
+    $n = 0
+    foreach ($f in $files) {
+        $rel = $f.Name
+        $dst = Join-Path $Target $rel
+        if ($f.Value.stock) {
+            $src = Join-Path $backup $rel
+            if (Test-Path -LiteralPath $src) {
+                Copy-Item -LiteralPath $src -Destination $dst -Force
+                $n++
+            } else {
+                Write-Host "  no backup for $rel, left as is" -ForegroundColor Yellow
+            }
+        } elseif (Test-Path -LiteralPath $dst) {
+            Remove-Item -LiteralPath $dst -Force
+            $n++
+        }
+    }
+    $old = (Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json).upscaler
+    if ($null -ne $old) { Set-Upscaler $old }
+    Remove-Item -LiteralPath $backup -Recurse -Force
+    Remove-Item -LiteralPath $marker -Force
+    Write-Host ''
+    Write-Host "Path tracing removed: $n files restored. The folder is back to Bloodborne PC $($man.base_version)." -ForegroundColor Green
+    exit 0
+}
+
+# Install.
+$installed = Test-Path -LiteralPath $marker
+if (-not $installed) {
+    $version = (Get-Content -LiteralPath (Join-Path $Target 'bbport-files.json') -Raw | ConvertFrom-Json).version
+    if ($version -ne $man.base_version) {
+        Stop-Install "This mod needs Bloodborne PC $($man.base_version); this folder has $version. Get $($man.base_version) from https://github.com/Supermedo/bloodborne_pc/releases/tag/windows-v$($man.base_version)"
+    }
+    $changed = 0
+    foreach ($f in $files) {
+        $dst = Join-Path $Target $f.Name
+        if (-not (Test-Path -LiteralPath $dst)) { continue }
+        if ($f.Value.stock -and (Get-Sha $dst) -ne $f.Value.stock) { $changed++ }
+        $bk = Join-Path $backup $f.Name
+        New-Item -ItemType Directory -Force -Path (Split-Path $bk -Parent) | Out-Null
+        Copy-Item -LiteralPath $dst -Destination $bk -Force
+    }
+    if ($changed) { Write-Host "  $changed files differed from stock $($man.base_version); they are backed up too." -ForegroundColor Yellow }
+    Write-Host "Backup of the replaced files: $backup"
+}
+
+$bad = @()
+foreach ($f in $files) {
+    $src = Join-Path (Join-Path $here 'payload') $f.Name
+    $dst = Join-Path $Target $f.Name
+    New-Item -ItemType Directory -Force -Path (Split-Path $dst -Parent) | Out-Null
+    Copy-Item -LiteralPath $src -Destination $dst -Force
+    Unblock-File -LiteralPath $dst
+    if ((Get-Sha $dst) -ne $f.Value.rt) { $bad += $f.Name }
+}
+if ($bad.Count) { Stop-Install "These files did not copy right: $($bad -join ', ')" }
+
+# Path tracing pt2 builds nothing under FSR 4.1, the launcher's own pick when no upscaler is set:
+# switch to DLSS on NVIDIA, else FSR 3.1. The old value goes back on uninstall.
+$state = @{ rt_version = $man.rt_version; base_version = $man.base_version; installed = (Get-Date).ToString('s') }
+if ($installed) { $state.upscaler = (Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json).upscaler }
+$up = Get-Upscaler
+if (-not $up -or $up -in @('fsr411', 'fsr412')) {
+    $nvidia = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' }).Count -gt 0
+    $new = if ($nvidia) { 'dlss' } else { 'fsr3' }
+    if (-not $installed) { $state.upscaler = if ($null -eq $up) { '' } else { $up } }
+    Set-Upscaler $new
+    $was = if ($up) { $up } else { 'automatic' }
+    Write-Host "Upscaler: $was -> $new (path tracing does not start with FSR 4.1 in this build)." -ForegroundColor Yellow
+}
+$state | ConvertTo-Json | Set-Content -LiteralPath $marker -Encoding ASCII
+Write-Host ''
+Write-Host "Path tracing $($man.rt_version) installed ($($files.Count) files checked)." -ForegroundColor Green
+Write-Host 'Start Bloodborne.exe as usual. Settings: Graphics page > Path tracing.'
+Write-Host 'To remove it, run "Uninstall Path Tracing.bat".'
