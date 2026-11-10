@@ -7,6 +7,12 @@ moonlight and bounce light, traced shadows and reflections, water and puddle mir
 > with effects such as fire, fog and glows, water and the overall look. Expect bugs, places that
 > look wrong, and big changes between versions.
 
+![Flooded street: lamp light mirrored in the water](docs/media/flooded-street.jpg)
+
+![Cainhurst: a ghost on the stairs](docs/media/cainhurst-ghost.gif)
+
+![Cainhurst balcony: torch and moonlight shadows](docs/media/cainhurst-balcony.jpg)
+
 ## Download
 
 **[Download the latest release](https://github.com/Joaovitor404silva/bloodborne-pc-path-tracing/releases/latest)**
