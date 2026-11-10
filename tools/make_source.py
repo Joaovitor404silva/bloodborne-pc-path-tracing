@@ -1,22 +1,59 @@
-"""Corresponding source zip of a path tracing build (GPL-2.0), local paths scrubbed.
+"""Write source/ with only our path tracing work, local paths scrubbed (GPL-2.0 corresponding source).
 
-usage: make_source.py REPO TAG OUT_ZIP
+usage: make_source.py REPO BASE_TAG RT_TAG OUT_DIR
+
+REPO is the bloodborne_pc checkout with both tags (BASE_TAG = SuperMedo's windows-v1.9.7).
+- Files we added go to OUT_DIR at their paths, as they are.
+- Our edits to SuperMedo's files go to OUT_DIR/supermedo-<version>.patch, one diff against BASE_TAG.
+SuperMedo's own files are not copied. Left out: the launcher change (the mod no longer replaces
+the launcher) and the upstream README.
 """
-import io
+import os
 import re
+import shutil
 import subprocess
 import sys
-import zipfile
 
-repo, tag, out = sys.argv[1:4]
-data = subprocess.run(["git", "-C", repo, "archive", "--format=zip", f"--prefix=bloodborne_pc-{tag}/", tag],
-                      check=True, capture_output=True).stdout
-private = re.compile(rb"C:[\\/]+Users[\\/]+[^\\/\s)]+")
+repo, base, rt, out = sys.argv[1:5]
+SKIP = ("launcher/", "README.md", "tests/test_fsr412_launcher.py")
+private = re.compile(rb"C:[\\/]+Users[\\/]+[^\\/\s)\"']+")
+
+
+def git(*args):
+    return subprocess.run(["git", "-C", repo, *args], check=True, capture_output=True).stdout
+
+
+def scrub(data):
+    return private.subn(rb"C:\\Users\\<user>", data)
+
+
+if os.path.exists(out):
+    shutil.rmtree(out)
+os.makedirs(out)
+added, modified = [], []
+for line in git("diff", "--name-status", "--no-renames", base, rt).decode().splitlines():
+    status, path = line.split("\t", 1)
+    if path.startswith(SKIP):
+        continue
+    if status == "A":
+        added.append(path)
+    elif status == "M":
+        modified.append(path)
+    else:
+        sys.exit(f"unexpected {status} {path}")
+
 n = 0
-with zipfile.ZipFile(io.BytesIO(data)) as src, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
-    for info in src.infolist():
-        body = src.read(info)
-        body, k = private.subn(rb"C:\\Users\\<user>", body)
-        n += k
-        dst.writestr(info, body)
-print("scrubbed", n, "paths")
+for path in added:
+    body, k = scrub(git("show", f"{rt}:{path}"))
+    n += k
+    dst = os.path.join(out, path)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, "wb") as fh:
+        fh.write(body)
+
+patch, k = scrub(git("diff", "--binary", "--no-renames", base, rt, "--", *modified))
+n += k
+name = f"supermedo-{base.removeprefix('windows-v')}.patch"
+with open(os.path.join(out, name), "wb") as fh:
+    fh.write(patch)
+print(f"{len(added)} added files, {len(modified)} patched files in {name}, {n} paths scrubbed")

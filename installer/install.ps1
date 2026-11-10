@@ -85,6 +85,49 @@ $marker = Join-Path $Target $markerName
 $backup = Join-Path $Target $backupName
 $ini = Join-Path $Target 'bbport.ini'
 
+# Path tracing is switched on by environment variables. SuperMedo's launcher passes the ones in its
+# Advanced > Diagnostics > Extra variables field (extra_env in %APPDATA%\bbport-launcher\settings.json)
+# to the game, so the launcher itself is not replaced. These are the tuned pt2 values.
+$settings = Join-Path $env:APPDATA 'bbport-launcher\settings.json'
+$rtEnv = @('BB_RT=1', 'BB_RT_DIRECT=1', 'BB_RT_GI=1', 'BB_RT_COMPACT=0', 'BB_RT_REFIT_BUDGET=0', 'BB_RT_FILL_LIGHT=off',
+    'BB_HDR_GAMMA=0', 'BB_RT_FILL_ENCLOSED=0.1', 'BB_RT_SKIN_ALPHA=1', 'BB_RT_FX_FOG=0', 'BB_RT_FX_FOG_G=0',
+    'BB_RT_GI_LAST_BOUNCE_CACHE=1', 'BB_RT_GI_SER=1', 'BB_RT_GI_PIPELINE=1', 'BB_RT_RESTIR_GI=1', 'BB_RT_DLSS_RR=0',
+    'BB_RT_KEEP_GI=1')
+$rtKeys = @($rtEnv | ForEach-Object { $_.Split('=')[0] })
+$envRx = [regex]'"extra_env"\s*:\s*"((?:[^"\\]|\\.)*)"'
+
+# The extra_env value as written in the file (JSON-escaped), '' when missing, $null without the file.
+function Get-ExtraEnv {
+    if (-not (Test-Path -LiteralPath $settings)) { return $null }
+    $m = $envRx.Match([IO.File]::ReadAllText($settings))
+    if ($m.Success) { return $m.Groups[1].Value }
+    return ''
+}
+
+# Writes extra_env, keeping the rest of the file as it is; checks the result is still valid JSON.
+function Set-ExtraEnv([string]$value) {
+    $line = '"extra_env": "' + $value + '"'
+    $old = $null
+    if (Test-Path -LiteralPath $settings) {
+        $old = [IO.File]::ReadAllText($settings)
+        if ($envRx.IsMatch($old)) { $raw = $envRx.Replace($old, [Text.RegularExpressions.MatchEvaluator] { param($m) $line }, 1) }
+        elseif ($old.Trim() -match '^\{\s*\}$') { $raw = "{`n  $line`n}`n" }
+        else { $raw = ([regex]'\{').Replace($old, "{`n  $line,", 1) }
+    } else {
+        New-Item -ItemType Directory -Force -Path (Split-Path $settings -Parent) | Out-Null
+        $raw = "{`n  $line`n}`n"
+    }
+    [IO.File]::WriteAllText($settings, $raw, (New-Object Text.UTF8Encoding $false))
+    try { $null = [IO.File]::ReadAllText($settings) | ConvertFrom-Json }
+    catch {
+        if ($null -ne $old) { [IO.File]::WriteAllText($settings, $old, (New-Object Text.UTF8Encoding $false)) }
+        throw "could not write the launcher settings ($settings)"
+    }
+}
+
+function Split-Env([string]$value) { return @(($value -split '\s+') | Where-Object { $_ }) }
+function Test-RtToken([string]$token) { return $rtKeys -contains $token.Split('=')[0] }
+
 # The upscaler line of bbport.ini: its value, '' when the line is missing, $null without the file.
 function Get-Upscaler {
     if (-not (Test-Path -LiteralPath $ini)) { return $null }
@@ -133,6 +176,12 @@ if ($Uninstall) {
     if ($state.ini_existed -eq $false -and (Test-Path -LiteralPath $ini)) {
         $other = @(Get-Content -LiteralPath $ini | Where-Object { $_ -notmatch '^\s*(#.*)?$' -and $_ -notmatch '^\s*upscaler\s*=' })
         if ($other.Count -eq 0) { Remove-Item -LiteralPath $ini -Force }
+    }
+    # Our variables leave the launcher's Extra variables; the ones they replaced come back.
+    $cur = Get-ExtraEnv
+    if ($null -ne $cur) {
+        $tokens = @(Split-Env $cur | Where-Object { -not (Test-RtToken $_) }) + @(Split-Env ([string]$state.env_replaced))
+        Set-ExtraEnv ($tokens -join ' ')
     }
     Remove-Item -LiteralPath $backup -Recurse -Force
     Remove-Item -LiteralPath $marker -Force
@@ -208,13 +257,20 @@ try {
 # Path tracing pt2 builds nothing under FSR 4.1, the launcher's own pick when no upscaler is set:
 # switch to DLSS on NVIDIA, else FSR 3.1. The old value goes back on uninstall.
 $state = @{ rt_version = $man.rt_version; base_version = $man.base_version; installed = (Get-Date).ToString('s') }
+$curEnv = Get-ExtraEnv
 if ($installed) {
     $prev = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
     $state.upscaler = $prev.upscaler
     if ($null -ne $prev.ini_existed) { $state.ini_existed = $prev.ini_existed }
+    $state.env_replaced = [string]$prev.env_replaced
 } else {
     $state.ini_existed = Test-Path -LiteralPath $ini
+    # The user's own values for our variables, put back on uninstall.
+    $state.env_replaced = (@(Split-Env ([string]$curEnv) | Where-Object { Test-RtToken $_ }) -join ' ')
 }
+$keepEnv = @(Split-Env ([string]$curEnv) | Where-Object { -not (Test-RtToken $_) })
+Set-ExtraEnv ((@($keepEnv) + $rtEnv) -join ' ')
+Write-Host 'Launcher: path tracing variables added to Advanced > Diagnostics > Extra variables.'
 $up = Get-Upscaler
 if (-not $up -or $up -in @('fsr411', 'fsr412')) {
     $nvidia = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' }).Count -gt 0
@@ -227,6 +283,6 @@ if (-not $up -or $up -in @('fsr411', 'fsr412')) {
 $state | ConvertTo-Json | Set-Content -LiteralPath $marker -Encoding ASCII
 Write-Host ''
 Write-Host "Path tracing $($man.rt_version) installed ($($files.Count) files checked)." -ForegroundColor Green
-Write-Host 'Start Bloodborne.exe as usual. Settings: Graphics page > Path tracing.'
+Write-Host 'Start Bloodborne.exe as usual. In game, F9 turns path tracing off and on.'
 Write-Host 'To remove it, run "Uninstall Path Tracing.bat".'
 Exit-Script 0
