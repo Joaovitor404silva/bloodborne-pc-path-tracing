@@ -7,11 +7,11 @@ moonlight and bounce light, traced shadows and reflections, water and puddle mir
 > with effects such as fire, fog and glows, water and the overall look. Expect bugs, places that
 > look wrong, and big changes between versions.
 
-![Flooded street: lamp light mirrored in the water](docs/media/flooded-street.jpg)
-
 ![Moonlit walk to the statues](docs/media/moonlit-walk.gif)
 
 ![Cainhurst: a ghost on the stairs](docs/media/cainhurst-ghost.gif)
+
+![Flooded street: lamp light mirrored in the water](docs/media/flooded-street.jpg)
 
 ![Forbidden Woods: lantern and shrine light](docs/media/forbidden-woods.jpg)
 
