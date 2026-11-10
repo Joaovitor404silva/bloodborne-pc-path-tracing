@@ -4,6 +4,10 @@ Bloodborne PC - Path Tracing mod (pt2)
 Real-time path tracing for SuperMedo's Bloodborne PC port: moonlight, bounce light,
 shadows, reflections, water and puddle mirrors, traced glass.
 
+ALPHA: this is an early build and work is ongoing. Light sources are being remade,
+along with effects (fire, fog, glows), water and the overall look. Expect bugs, places
+that look wrong, and big changes between versions.
+
 NEEDS
 - Bloodborne PC 1.9.7 (SuperMedo), already installed and working:
   https://github.com/Supermedo/bloodborne_pc/releases/tag/windows-v1.9.7
@@ -28,6 +32,12 @@ UPSCALER
 Path tracing pt2 does not start with FSR 4.1 (the launcher's automatic pick). If your
 upscaler is FSR 4.1 or automatic, the installer sets DLSS on NVIDIA cards, else FSR 3.1.
 Keep DLSS or FSR 3.1. Uninstall puts your old setting back.
+
+KNOWN ISSUE (pt2)
+Path tracing can stay off after the game starts (the lighting looks like stock): its
+memory fills during loading and is never freed. In our tests it worked with DLSS or
+FSR 3.1 and frame generation off; it got stuck with FSR 4.1 and with DLSS frame
+generation. If it happens, turn frame generation off and restart the game.
 
 NOTES
 - Update checks are off in this build: the upstream update has no path tracing.
