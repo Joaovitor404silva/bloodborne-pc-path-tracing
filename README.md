@@ -38,6 +38,10 @@ The installer checks the folder is 1.9.7 and backs up the 84 files it replaces t
 It then copies the new files, including NVIDIA's DLSS Ray Reconstruction DLL, and checks
 every copied file by SHA-256.
 
+In a protected folder such as Program Files, Windows asks for administrator rights. If a copy
+fails (a file in use by the game or an antivirus), the installer puts every file back, leaves the
+folder as it was, and says what failed.
+
 **Upscaler:** pt2 does not start path tracing under FSR 4.1, which is the launcher's
 automatic pick. In that case the installer sets DLSS on NVIDIA cards and FSR 3.1 on others.
 Keep DLSS or FSR 3.1.

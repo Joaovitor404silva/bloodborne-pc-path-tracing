@@ -1,5 +1,6 @@
 # Bloodborne PC path tracing mod: installs over (or removes from) a Bloodborne PC folder.
-param([switch]$Uninstall, [string]$Target)
+# -Elevated is set by the script itself when it restarts with administrator rights.
+param([switch]$Uninstall, [string]$Target, [switch]$Elevated)
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $man = Get-Content -LiteralPath (Join-Path $here 'manifest.json') -Raw | ConvertFrom-Json
@@ -7,10 +8,32 @@ $files = @($man.files.PSObject.Properties)
 $markerName = 'rt-installed.json'
 $backupName = 'rt-backup'
 
+# The elevated window closes on exit, so it waits for a key first.
+function Exit-Script([int]$code) {
+    if ($Elevated) { Write-Host ''; Read-Host 'Press Enter to close' | Out-Null }
+    exit $code
+}
+
 function Stop-Install([string]$msg) {
     Write-Host ''
     Write-Host "ERROR: $msg" -ForegroundColor Red
-    exit 1
+    Write-Host 'Nothing was installed or removed.' -ForegroundColor Red
+    Exit-Script 1
+}
+
+trap {
+    Write-Host ''
+    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+    Exit-Script 1
+}
+
+function Test-Writable([string]$dir) {
+    try {
+        $probe = Join-Path $dir ".rt-write-test-$PID"
+        [IO.File]::WriteAllText($probe, 'x')
+        Remove-Item -LiteralPath $probe -Force
+        return $true
+    } catch { return $false }
 }
 
 function Test-Port([string]$dir) {
@@ -42,6 +65,21 @@ Write-Host "Bloodborne PC folder: $Target"
 $running = Get-Process -Name 'bb-probe', 'Bloodborne', 'Play Bloodborne' -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -and $_.Path.StartsWith($Target, [StringComparison]::OrdinalIgnoreCase) }
 if ($running) { Stop-Install 'Close the game and the launcher first.' }
+
+# A protected folder (Program Files and the like) needs administrator rights: ask for them once.
+if (-not ((Test-Writable $Target) -and (Test-Writable (Join-Path $Target 'bin')))) {
+    if ($Elevated) { Stop-Install "Windows does not allow writing to $Target, even as administrator." }
+    Write-Host 'This folder needs administrator rights. Windows will ask for them now.' -ForegroundColor Yellow
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$($MyInvocation.MyCommand.Path)`"",
+        '-Target', "`"$Target`"", '-Elevated')
+    if ($Uninstall) { $argList += '-Uninstall' }
+    try {
+        $p = Start-Process powershell.exe -Verb RunAs -ArgumentList $argList -Wait -PassThru
+    } catch { Stop-Install 'Administrator rights were refused.' }
+    if ($p.ExitCode -ne 0) { Write-Host ''; Write-Host 'ERROR: the administrator window reported a failure (see that window).' -ForegroundColor Red }
+    else { Write-Host 'Done in the administrator window.' -ForegroundColor Green }
+    exit $p.ExitCode
+}
 
 $marker = Join-Path $Target $markerName
 $backup = Join-Path $Target $backupName
@@ -88,13 +126,19 @@ if ($Uninstall) {
             $n++
         }
     }
-    $old = (Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json).upscaler
+    $state = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
+    $old = $state.upscaler
     if ($null -ne $old) { Set-Upscaler $old }
+    # No bbport.ini before the install: drop the one the install made if it holds no other setting.
+    if ($state.ini_existed -eq $false -and (Test-Path -LiteralPath $ini)) {
+        $other = @(Get-Content -LiteralPath $ini | Where-Object { $_ -notmatch '^\s*(#.*)?$' -and $_ -notmatch '^\s*upscaler\s*=' })
+        if ($other.Count -eq 0) { Remove-Item -LiteralPath $ini -Force }
+    }
     Remove-Item -LiteralPath $backup -Recurse -Force
     Remove-Item -LiteralPath $marker -Force
     Write-Host ''
     Write-Host "Path tracing removed: $n files restored. The folder is back to Bloodborne PC $($man.base_version)." -ForegroundColor Green
-    exit 0
+    Exit-Script 0
 }
 
 # Install.
@@ -104,34 +148,73 @@ if (-not $installed) {
     if ($version -ne $man.base_version) {
         Stop-Install "This mod needs Bloodborne PC $($man.base_version); this folder has $version. Get $($man.base_version) from https://github.com/Supermedo/bloodborne_pc/releases/tag/windows-v$($man.base_version)"
     }
-    $changed = 0
-    foreach ($f in $files) {
-        $dst = Join-Path $Target $f.Name
-        if (-not (Test-Path -LiteralPath $dst)) { continue }
-        if ($f.Value.stock -and (Get-Sha $dst) -ne $f.Value.stock) { $changed++ }
-        $bk = Join-Path $backup $f.Name
-        New-Item -ItemType Directory -Force -Path (Split-Path $bk -Parent) | Out-Null
-        Copy-Item -LiteralPath $dst -Destination $bk -Force
-    }
-    if ($changed) { Write-Host "  $changed files differed from stock $($man.base_version); they are backed up too." -ForegroundColor Yellow }
-    Write-Host "Backup of the replaced files: $backup"
 }
 
+# Files that are already there before the install: only these get backed up and put back.
+$existed = @{}
+foreach ($f in $files) { if (Test-Path -LiteralPath (Join-Path $Target $f.Name)) { $existed[$f.Name] = $true } }
+$copying = $false
 $bad = @()
-foreach ($f in $files) {
-    $src = Join-Path (Join-Path $here 'payload') $f.Name
-    $dst = Join-Path $Target $f.Name
-    New-Item -ItemType Directory -Force -Path (Split-Path $dst -Parent) | Out-Null
-    Copy-Item -LiteralPath $src -Destination $dst -Force
-    Unblock-File -LiteralPath $dst
-    if ((Get-Sha $dst) -ne $f.Value.rt) { $bad += $f.Name }
+try {
+    if (-not $installed) {
+        $changed = 0
+        foreach ($f in $files) {
+            if (-not $existed[$f.Name]) { continue }
+            $dst = Join-Path $Target $f.Name
+            if ($f.Value.stock -and (Get-Sha $dst) -ne $f.Value.stock) { $changed++ }
+            $bk = Join-Path $backup $f.Name
+            New-Item -ItemType Directory -Force -Path (Split-Path $bk -Parent) | Out-Null
+            Copy-Item -LiteralPath $dst -Destination $bk -Force
+        }
+        if ($changed) { Write-Host "  $changed files differed from stock $($man.base_version); they are backed up too." -ForegroundColor Yellow }
+        Write-Host "Backup of the replaced files: $backup"
+    }
+    $copying = $true
+    foreach ($f in $files) {
+        $src = Join-Path (Join-Path $here 'payload') $f.Name
+        $dst = Join-Path $Target $f.Name
+        New-Item -ItemType Directory -Force -Path (Split-Path $dst -Parent) | Out-Null
+        Copy-Item -LiteralPath $src -Destination $dst -Force
+        Unblock-File -LiteralPath $dst
+        if ((Get-Sha $dst) -ne $f.Value.rt) { $bad += $f.Name }
+    }
+    if ($bad.Count) { throw "these files did not copy right: $($bad -join ', ')" }
+} catch {
+    $why = $_.Exception.Message
+    if ($installed) {
+        Write-Host ''
+        Write-Host "ERROR: $why" -ForegroundColor Red
+        Write-Host 'Run "Uninstall Path Tracing.bat" to go back to stock, or close what holds the files and install again.' -ForegroundColor Red
+        Exit-Script 1
+    }
+    # First install failed half way: put the backed-up files back and remove the added ones.
+    # A failure while backing up has changed nothing, so then only the backup goes.
+    if ($copying) {
+        foreach ($f in $files) {
+            $dst = Join-Path $Target $f.Name
+            $bk = Join-Path $backup $f.Name
+            try {
+                if ($existed[$f.Name]) {
+                    if ((Test-Path -LiteralPath $bk) -and (Get-Sha $bk) -ne (Get-Sha $dst)) { Copy-Item -LiteralPath $bk -Destination $dst -Force }
+                }
+                elseif (Test-Path -LiteralPath $dst) { Remove-Item -LiteralPath $dst -Force }
+            } catch { Write-Host "  could not restore $($f.Name)" -ForegroundColor Yellow }
+        }
+    }
+    Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+    Stop-Install "$why (is the game or an antivirus holding a file?)"
 }
-if ($bad.Count) { Stop-Install "These files did not copy right: $($bad -join ', ')" }
 
 # Path tracing pt2 builds nothing under FSR 4.1, the launcher's own pick when no upscaler is set:
 # switch to DLSS on NVIDIA, else FSR 3.1. The old value goes back on uninstall.
 $state = @{ rt_version = $man.rt_version; base_version = $man.base_version; installed = (Get-Date).ToString('s') }
-if ($installed) { $state.upscaler = (Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json).upscaler }
+if ($installed) {
+    $prev = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
+    $state.upscaler = $prev.upscaler
+    if ($null -ne $prev.ini_existed) { $state.ini_existed = $prev.ini_existed }
+} else {
+    $state.ini_existed = Test-Path -LiteralPath $ini
+}
 $up = Get-Upscaler
 if (-not $up -or $up -in @('fsr411', 'fsr412')) {
     $nvidia = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' }).Count -gt 0
@@ -146,3 +229,4 @@ Write-Host ''
 Write-Host "Path tracing $($man.rt_version) installed ($($files.Count) files checked)." -ForegroundColor Green
 Write-Host 'Start Bloodborne.exe as usual. Settings: Graphics page > Path tracing.'
 Write-Host 'To remove it, run "Uninstall Path Tracing.bat".'
+Exit-Script 0

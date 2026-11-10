@@ -20,9 +20,13 @@ INSTALL
    it asks for it (the folder with Bloodborne.exe).
 4. Start Bloodborne.exe as usual. Settings: Graphics page > Path tracing.
 
-The installer replaces 85 files of the port (launcher, renderer and its DLLs) and adds
+The installer replaces 84 files of the port (launcher, renderer and its DLLs) and adds
 NVIDIA's DLSS Ray Reconstruction DLL. The files it replaces go to "rt-backup" in the
 game folder. It checks every copied file.
+
+If the game is in a protected folder (Program Files, for example), Windows asks for
+administrator rights. If something goes wrong (a file in use by the game or an
+antivirus), the installer puts every file back and says what failed.
 
 UNINSTALL
 Double-click "Uninstall Path Tracing.bat": the backup goes back and the folder is stock
