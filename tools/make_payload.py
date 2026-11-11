@@ -24,12 +24,15 @@ def tree(root):
 
 
 # The path tracing renderer, our DLSS bridge (Ray Reconstruction) and NVIDIA's Ray Reconstruction DLL.
-SHIP = ("bin/bb-probe.exe", "bin/bbport_dlss.dll", "bin/nvngx_dlssd.dll")
+# RT_DIR may hold more (a newer MSYS2 DLL the build step found the exe needs); all of it ships.
+CORE = ("bin/bb-probe.exe", "bin/bbport_dlss.dll", "bin/nvngx_dlssd.dll")
 
 stock_dir, rt_dir, out_dir, base, rt_version = sys.argv[1:6]
 stock, rt = tree(stock_dir), tree(rt_dir)
+if not all(rel in rt for rel in CORE):
+    sys.exit(f"{rt_dir} lacks one of {CORE}")
 files = {}
-for rel in SHIP:
+for rel in sorted(rt, key=lambda r: (r not in CORE, CORE.index(r) if r in CORE else r)):
     h = rt[rel]
     if stock.get(rel) == h:
         sys.exit(f"{rel} is the same as stock: not a path tracing build?")

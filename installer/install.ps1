@@ -84,6 +84,19 @@ if (-not ((Test-Writable $Target) -and (Test-Writable (Join-Path $Target 'bin'))
 $marker = Join-Path $Target $markerName
 $backup = Join-Path $Target $backupName
 $ini = Join-Path $Target 'bbport.ini'
+$portList = Get-Content -LiteralPath (Join-Path $Target 'bbport-files.json') -Raw | ConvertFrom-Json
+$folderVersion = $portList.version
+$prev = $null
+if (Test-Path -LiteralPath $marker) { $prev = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json }
+# Bloodborne PC was updated after path tracing was installed: the backup holds the old version's files.
+$stale = $prev -and $prev.base_version -and ($prev.base_version -ne $folderVersion)
+
+# The sha256 Bloodborne PC lists for a file of this folder, $null when it lists none.
+function Get-PortSha([string]$rel) {
+    $p = $portList.files.PSObject.Properties[$rel]
+    if ($p) { return $p.Value }
+    return $null
+}
 
 # Path tracing is switched on by environment variables. SuperMedo's launcher passes the ones in its
 # Advanced > Diagnostics > Extra variables field (extra_env in %APPDATA%\bbport-launcher\settings.json)
@@ -156,6 +169,16 @@ if ($Uninstall) {
     foreach ($f in $files) {
         $rel = $f.Name
         $dst = Join-Path $Target $rel
+        if ($stale) {
+            # The backup is of the old version: never put it back. Remove only what the port does not list.
+            if (-not (Test-Path -LiteralPath $dst)) { continue }
+            $want = Get-PortSha $rel
+            if (-not $want) { Remove-Item -LiteralPath $dst -Force; $n++ }
+            elseif ((Get-Sha $dst) -ne $want) {
+                Write-Host "  $rel is not Bloodborne PC $folderVersion's own file: repair or reinstall Bloodborne PC." -ForegroundColor Yellow
+            }
+            continue
+        }
         if ($f.Value.stock) {
             $src = Join-Path $backup $rel
             if (Test-Path -LiteralPath $src) {
@@ -183,27 +206,26 @@ if ($Uninstall) {
         $tokens = @(Split-Env $cur | Where-Object { -not (Test-RtToken $_) }) + @(Split-Env ([string]$state.env_replaced))
         Set-ExtraEnv ($tokens -join ' ')
     }
-    Remove-Item -LiteralPath $backup -Recurse -Force
+    Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $marker -Force
     Write-Host ''
-    Write-Host "Path tracing removed: $n files restored. The folder is back to Bloodborne PC $($man.base_version)." -ForegroundColor Green
+    Write-Host "Path tracing removed: $n files restored. The folder is back to Bloodborne PC $folderVersion." -ForegroundColor Green
     Exit-Script 0
 }
 
 # Install.
 $installed = Test-Path -LiteralPath $marker
-if ($installed) {
+if ($installed -and -not $stale -and $prev.rt_version -ne $man.rt_version) {
     # Another version's backup holds other files: its own uninstaller has to put them back first.
-    $other = (Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json).rt_version
-    if ($other -ne $man.rt_version) {
-        Stop-Install "Path tracing $other is installed here. Run the Uninstall Path Tracing.bat of $other first, then install $($man.rt_version)."
-    }
+    Stop-Install "Path tracing $($prev.rt_version) is installed here. Run the Uninstall Path Tracing.bat of $($prev.rt_version) first, then install $($man.rt_version)."
 }
-if (-not $installed) {
-    $version = (Get-Content -LiteralPath (Join-Path $Target 'bbport-files.json') -Raw | ConvertFrom-Json).version
-    if ($version -ne $man.base_version) {
-        Stop-Install "This mod needs Bloodborne PC $($man.base_version); this folder has $version. Get $($man.base_version) from https://github.com/Supermedo/bloodborne_pc/releases/tag/windows-v$($man.base_version)"
-    }
+if ($folderVersion -ne $man.base_version) {
+    Stop-Install "This mod needs Bloodborne PC $($man.base_version); this folder has $folderVersion. Get $($man.base_version) from https://github.com/Supermedo/bloodborne_pc/releases/tag/windows-v$($man.base_version)"
+}
+if ($stale) {
+    Write-Host "Bloodborne PC was updated to $folderVersion after path tracing $($prev.rt_version) was installed: installing fresh." -ForegroundColor Yellow
+    Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+    $installed = $false
 }
 
 # Files that are already there before the install: only these get backed up and put back.
@@ -270,6 +292,11 @@ if ($installed) {
     $state.upscaler = $prev.upscaler
     if ($null -ne $prev.ini_existed) { $state.ini_existed = $prev.ini_existed }
     $state.env_replaced = [string]$prev.env_replaced
+} elseif ($stale) {
+    # The old install already holds what the user had before path tracing.
+    $state.upscaler = $prev.upscaler
+    if ($null -ne $prev.ini_existed) { $state.ini_existed = $prev.ini_existed }
+    $state.env_replaced = [string]$prev.env_replaced
 } else {
     $state.ini_existed = Test-Path -LiteralPath $ini
     # The user's own values for our variables, put back on uninstall.
@@ -282,7 +309,7 @@ $up = Get-Upscaler
 if (-not $up -or $up -in @('fsr411', 'fsr412')) {
     $nvidia = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' }).Count -gt 0
     $new = if ($nvidia) { 'dlss' } else { 'fsr3' }
-    if (-not $installed) { $state.upscaler = if ($null -eq $up) { '' } else { $up } }
+    if (-not $installed -and -not $stale) { $state.upscaler = if ($null -eq $up) { '' } else { $up } }
     Set-Upscaler $new
     $was = if ($up) { $up } else { 'automatic' }
     Write-Host "Upscaler: $was -> $new (path tracing does not start with FSR 4.1 in this build)." -ForegroundColor Yellow

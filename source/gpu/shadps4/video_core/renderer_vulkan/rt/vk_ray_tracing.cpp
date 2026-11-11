@@ -9240,6 +9240,11 @@ void RayTracing::FinishFrame(const SceneInputs& inputs) {
         slot_ticks[pass_slot] = scheduler.CurrentTick();
     }
     surface_holds.Finish(scheduler.CurrentTick(), built_this_frame, slot, HoldFn());
+    const u64 end_tick = scheduler.CurrentTick();
+    Rt::CloseFrame(retired, frame, end_tick);
+    Rt::CloseFrame(retired_uv, frame, end_tick);
+    Rt::CloseFrame(retired_omm, frame, end_tick);
+    Rt::CloseFrame(retired_omm_index, frame, end_tick);
     if (DirectTrace()) {
         Trace("frame end: %u light-VS draws, %u skipped, %u composite hooks", frame_light_draws,
               frame_light_draws_skipped, frame_direct_calls);

@@ -267,6 +267,19 @@ inline void NoteTlas(RetiredBlock& block, uint64_t tlas_frame, uint64_t tlas_tic
     }
 }
 
+// At the end of a frame: blocks retired in it or before that no TLAS came after yet take the
+// frame's end tick instead. Every trace builds its TLAS in its own frame (Build), so after this
+// frame's commands nothing reads an older TLAS. Without it, frames that build no TLAS (loading
+// screens: no camera) never free their retired blocks; the pool fills and path tracing stays off.
+template <class Blocks>
+void CloseFrame(Blocks& blocks, uint64_t frame, uint64_t end_tick) {
+    for (RetiredBlock& block : blocks) {
+        if (!block.tlas_tick && block.frame <= frame) {
+            block.tlas_tick = end_tick;
+        }
+    }
+}
+
 template <class Free>
 bool RetireReady(RetiredBlock& block, uint64_t tlas_frame, uint64_t tlas_tick, Free&& is_free) {
     NoteTlas(block, tlas_frame, tlas_tick);

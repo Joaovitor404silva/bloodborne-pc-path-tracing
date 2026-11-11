@@ -1,6 +1,7 @@
 #include <cassert>
 #include <cstdio>
 #include <set>
+#include <vector>
 
 #include "gpu/shadps4/video_core/renderer_vulkan/rt/rt_blas_cache.h"
 #include "gpu/shadps4/video_core/renderer_vulkan/rt/rt_omm.h"
@@ -46,6 +47,27 @@ static void TestRetire() {
         assert(!RetireReady(skipped, 9, 49, is_free));
     }
     assert(RetireReady(skipped, 20, 90, is_free));
+    // Loading screen: no camera, so no TLAS is ever built after the retirement. The end of the
+    // retirement frame stands in for it (every trace builds its TLAS in its own frame), else the
+    // pool fills with blocks that wait forever.
+    std::vector<RetiredBlock> loading{{.offset = 0, .bytes = 256, .tick = 50, .frame = 10}};
+    gpu_done = 1000;
+    assert(!RetireReady(loading[0], 9, 49, is_free));
+    CloseFrame(loading, 10, 52);
+    assert(loading[0].tlas_tick == 52);
+    gpu_done = 51;
+    assert(!RetireReady(loading[0], 9, 49, is_free));
+    gpu_done = 52;
+    assert(RetireReady(loading[0], 9, 49, is_free));
+    // A TLAS of the same frame after the retirement is kept: it came first.
+    std::vector<RetiredBlock> built{{.offset = 0, .bytes = 256, .tick = 50, .frame = 10}};
+    NoteTlas(built[0], 10, 51);
+    CloseFrame(built, 10, 52);
+    assert(built[0].tlas_tick == 51);
+    // Blocks retired in a later frame (not possible at a frame end, but kept safe) wait.
+    std::vector<RetiredBlock> later{{.offset = 0, .bytes = 256, .tick = 60, .frame = 11}};
+    CloseFrame(later, 10, 52);
+    assert(later[0].tlas_tick == 0);
 }
 
 static void TestCurve() {

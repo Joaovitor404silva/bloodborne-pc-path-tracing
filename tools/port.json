@@ -1,0 +1,8 @@
+{
+ "repo": "D:/modding/bbport-rt-perfall",
+ "base": "1.9.8.4",
+ "rt_ref": "rt-v1.9.8.4-pt2.2",
+ "rt_version": "pt2.2",
+ "dlss_sdk": "D:/modding/sdk/DLSS",
+ "msys2": "C:/msys64"
+}
