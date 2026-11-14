@@ -20,6 +20,9 @@ moonlight and bounce light, traced shadows and reflections, water and puddle mir
 **[Download the latest release](https://github.com/Joaovitor404silva/bloodborne-pc-path-tracing/releases/latest)**
 (`Bloodborne-Windows.zip`).
 
+**[Full source code](https://github.com/Joaovitor404silva/bloodborne_pc/tree/path-tracing-1.9.8.6)**:
+all of SuperMedo's files plus path tracing, ready to build yourself (see [Source](#source)).
+
 It is SuperMedo's whole Bloodborne PC 1.9.8.6 with path tracing built in: one unzip, nothing to
 install on top. All credit for the port (launcher, DLSS/FSR, online, everything but path tracing)
 goes to [SuperMedo](https://github.com/Supermedo/bloodborne_pc). Report path tracing problems
