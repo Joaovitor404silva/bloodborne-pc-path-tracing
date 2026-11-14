@@ -1,5 +1,10 @@
 # Bloodborne PC Path Tracing
 
+> **This project is closed.** Path tracing has been offered to SuperMedo's port as
+> [pull request #173](https://github.com/Supermedo/bloodborne_pc/pull/173). Please use
+> **[SuperMedo's Bloodborne PC port](https://github.com/Supermedo/bloodborne_pc)** and follow it
+> for updates. This repository is archived and gets no more releases.
+
 Adds real-time path tracing to [SuperMedo's Bloodborne PC port](https://github.com/Supermedo/bloodborne_pc):
 moonlight and bounce light, traced shadows and reflections, water and puddle mirrors, traced glass.
 
