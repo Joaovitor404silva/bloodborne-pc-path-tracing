@@ -5,6 +5,8 @@
 #include <cstdio>
 #include "gpu/shadps4/video_core/renderer_vulkan/rt/rt_gi.h"
 #include "gpu/shadps4/video_core/renderer_vulkan/rt/rt_gi_pipeline.h"
+#include "gpu/shadps4/video_core/renderer_vulkan/rt/rt_moon_cache.h"
+#include "gpu/shadps4/video_core/renderer_vulkan/rt/rt_sky_cache.h"
 
 using namespace Vulkan::Rt;
 
@@ -221,7 +223,11 @@ void TestEmissiveSky() {
     // mirrors, 6378f81). The buffer is sized from MaterialSlots, 16 bytes a slot.
     static_assert(SkyDomeMapSlot(8192) == SkyGainSlot(8192) + 1);
     static_assert(SkyImageSlot(8192, 0) == SkyDomeMapSlot(8192) + 1);
-    static_assert(MaterialSlots(8192) == 2 * 8192 + 3 + SkyProbeCells + SkyImageCells);
+    // Then the moon direction, the moon and cloud layer grid and its search stats.
+    static_assert(MoonDirSlot(8192) == SkyImageSlot(8192, SkyImageCells));
+    static_assert(SkyLayerSlot(8192, 0) == MoonDirSlot(8192) + 1);
+    static_assert(MaterialSlots(8192) ==
+                  2 * 8192 + 8 + SkyProbeCells + SkyImageCells + SkyLayerCells);
     static_assert(uint64_t(MaterialSlots(8192)) * 16u <= 64ull << 20);
     static_assert(BounceFlagEmissive != BounceFlagDirSets && BounceFlagEmissive > BounceFlagDirSets);
     const auto center = OctEncode({0.0f, 0.0f, 1.0f});
@@ -454,7 +460,152 @@ void TestGiPipelineFlags() {
     assert(GiPipelineFlags(false) == 0u);
 }
 
+void TestSkyCache() {
+    using namespace Vulkan::Rt;
+    // RGB9E5 keeps 9 bits of the brightest channel.
+    for (const float v : {0.0003f, 0.02f, 0.5f, 1.0f, 3.7f, 250.0f}) {
+        const auto c = UnpackRgb9e5(PackRgb9e5(v, v * 0.5f, v * 0.25f));
+        assert(std::fabs(c[0] - v) <= v / 256.0f);
+        assert(std::fabs(c[1] - v * 0.5f) <= v / 256.0f);
+        assert(std::fabs(c[2] - v * 0.25f) <= v / 256.0f);
+    }
+    assert(PackRgb9e5(0.0f, 0.0f, 0.0f) == 0u);
+    assert(PackRgb9e5(-1.0f, NAN, 0.0f) == 0u);
+    // Unseen cells stay 0, a seen black cell does not; runs survive the round trip.
+    const float cells[6 * 4] = {0, 0, 0, 0,   0.5f, 0.25f, 0.1f, 1,  0, 0, 0, 1,
+                                9, 9, 9, 0,   0, 0, 0, 0,          2.0f, 1.0f, 0.5f, 1};
+    size_t seen = 0;
+    const std::vector<uint32_t> words = PackSkyCells(cells, 6, &seen);
+    assert(seen == 3);
+    assert(words[0] == 0u && words[1] != 0u && words[2] != 0u && words[3] == 0u &&
+           words[4] == 0u && words[5] != 0u);
+    const std::vector<uint32_t> enc = EncodeSkyWords(words);
+    std::vector<uint32_t> back;
+    assert(DecodeSkyWords(enc, 6, back) && back == words);
+    assert(!DecodeSkyWords(enc, 7, back));
+    std::vector<uint32_t> cut(enc.begin(), enc.end() - 1);
+    assert(!DecodeSkyWords(cut, 6, back));
+    float out[6 * 4];
+    assert(UnpackSkyCells(words, out) == 3);
+    assert(out[3] == 0.0f && out[7] == 1.0f && std::fabs(out[4] - 0.5f) < 0.004f);
+    assert(out[11] == 1.0f && out[8] < 1e-6f);
+    assert(out[15] == 0.0f && std::fabs(out[20] - 2.0f) < 0.01f);
+}
+
+void TestSkyKeyAndMoonCache() {
+    // Clouds draw every frame, the moon only while in view: the key is the clouds alone.
+    SkyKey key;
+    assert(key.Add(10, 576, 147));
+    key.Add(10, 216, 63);
+    key.Add(10, 96, 24); // moon in view
+    assert(key.Key() == 0);
+    assert(!key.Add(11, 576, 147));
+    key.Add(11, 216, 63); // moon culled
+    const uint64_t with_moon = key.Key();
+    assert(with_moon != 0);
+    key.Add(12, 576, 147);
+    const uint64_t clouds = key.Key();
+    assert(clouds != 0 && clouds != with_moon);
+    key.Add(12, 216, 63);
+    key.Add(12, 96, 24); // the moon back does not change the key
+    key.Add(13, 576, 147);
+    key.Add(13, 216, 63);
+    key.Add(14, 576, 147);
+    assert(key.Key() == clouds);
+    // The same sky after a load (layer gone for longer than RestartFrames) gets the same key.
+    const uint64_t gen = key.Generation();
+    assert(key.Add(14 + SkyKey::RestartFrames + 1, 216, 63));
+    assert(key.Generation() == gen + 1);
+    key.Add(14 + SkyKey::RestartFrames + 1, 576, 147);
+    key.Add(14 + SkyKey::RestartFrames + 2, 576, 147);
+    assert(key.Key() == clouds);
+    assert(key.Recent(14 + SkyKey::RestartFrames + 4, 2));
+    assert(!key.Recent(14 + SkyKey::RestartFrames + 5, 2));
+
+    MoonCache cache;
+    assert(!cache.Put(0, {0.0f, 1.0f, 0.0f}));
+    assert(!cache.Put(clouds, {0.0f, NAN, 0.0f}));
+    assert(cache.Put(clouds, {0.0f, 700.0f, 0.0f}));
+    assert(Near((*cache.Find(clouds))[1], 700.0f));
+    assert(!cache.Put(clouds, {3.0f, 700.0f, 0.0f})); // the mean moved 1.5 m: not saved
+    assert(Near((*cache.Find(clouds))[0], 1.5f));
+    // Finds hopping between two grid cells 25 m apart settle on the middle.
+    for (int i = 0; i < 200; ++i) {
+        cache.Put(clouds, {i % 2 ? 12.5f : -12.5f, 700.0f, 0.0f});
+    }
+    assert(std::fabs((*cache.Find(clouds))[0]) < 1.0f);
+    // From one spot every find lands 10 m off the same way: the mean of 202 finds barely moves.
+    for (int i = 0; i < 50; ++i) {
+        cache.Put(clouds, {10.0f, 700.0f, 0.0f});
+    }
+    assert(std::fabs((*cache.Find(clouds))[0]) < 2.5f);
+    // Strays (52 m off from one spot, one at the horizon) never outvote the moon.
+    for (int i = 0; i < 200; ++i) {
+        assert(!cache.Put(clouds, {52.0f, 700.0f, 0.0f}));
+    }
+    assert(!cache.Put(clouds, {1650.0f, 70.0f, -600.0f}));
+    assert(std::fabs((*cache.Find(clouds))[0]) < 2.5f);
+    assert(Near(cache.Votes(clouds), 252.0f));
+    // A moon far from the cached one (a wrong spot voted in, or the game's moon of another area)
+    // takes over after SwitchVotes finds, not after outnumbering the 252 old ones.
+    int puts = 0;
+    bool moved = false;
+    for (; puts < 300 && !moved; ++puts) {
+        moved = cache.Put(clouds, {600.0f, 800.0f, 0.0f});
+    }
+    assert(moved && Near((*cache.Find(clouds))[0], 600.0f));
+    assert(puts == int(MoonCache::SwitchVotes));
+    // The light points from the camera at the moon, so its direction moves with the player.
+    std::array<float, 3> dir{};
+    assert(cache.DirFrom(clouds, {0.0f, 0.0f, 0.0f}, dir));
+    assert(Near(dir[0], 0.6f) && Near(dir[1], 0.8f) && Near(dir[2], 0.0f));
+    assert(cache.DirFrom(clouds, {600.0f, 0.0f, 0.0f}, dir));
+    assert(Near(dir[0], 0.0f) && Near(dir[1], 1.0f));
+    assert(!cache.DirFrom(clouds, {600.0f, 800.0f, 0.0f}, dir)); // at the moon
+    assert(!cache.DirFrom(with_moon, {0.0f, 0.0f, 0.0f}, dir));
+    MoonCache back;
+    back.Parse(cache.Text() + "junk line\n");
+    assert(back.Size() == 1);
+    assert(Near((*back.Find(clouds))[0], 600.0f) && Near((*back.Find(clouds))[1], 800.0f));
+    assert(Near(back.Votes(clouds), MoonCache::SwitchVotes)); // votes saved with the position
+    MoonCache old;
+    old.Parse("00000000000000aa 1 2 3\n"); // a line without votes counts LoadedSamples
+    assert(Near(old.Votes(0xaa), MoonCache::LoadedSamples));
+    assert(!back.Find(with_moon));
+
+    // Per draw: a run that saw other segments of the same sky still finds its moon, and a
+    // segment shared with another sky is outvoted.
+    SkyKey run1;
+    run1.Add(100, 576, 147);
+    run1.Add(100, 216, 63);
+    run1.Add(101, 300, 80);
+    assert(run1.Draws().size() == 3);
+    MoonCache draws;
+    assert(draws.PutDraws(run1.Draws(), {0.0f, 700.0f, 0.0f}));
+    for (int i = 0; i < 50; ++i) {
+        draws.Put(uint64_t(576) << 32 | 147, {0.0f, 700.0f, 0.0f}); // same sky, more finds
+    }
+    SkyKey run2; // a later boot facing elsewhere: only one segment in common
+    run2.Add(5, 300, 80);
+    run2.Add(5, 999, 11);
+    std::array<float, 3> pos{};
+    assert(draws.FindDraws(run2.Draws(), pos) && Near(pos[1], 700.0f));
+    // Another sky shares segment 576/147 at a different moon; its own segments outvote it.
+    MoonCache two;
+    two.PutDraws({uint64_t(576) << 32 | 147, uint64_t(216) << 32 | 63}, {0.0f, 700.0f, 0.0f});
+    two.PutDraws({uint64_t(400) << 32 | 1, uint64_t(401) << 32 | 2}, {700.0f, 0.0f, 0.0f});
+    two.Put(uint64_t(576) << 32 | 147, {700.0f, 0.0f, 0.0f}, 2000.0f); // shared, now wrong sky
+    assert(two.FindDraws({uint64_t(400) << 32 | 1, uint64_t(401) << 32 | 2,
+                          uint64_t(576) << 32 | 147},
+                         pos) &&
+           Near(pos[0], 700.0f));
+    assert(two.FindDraws({uint64_t(216) << 32 | 63, uint64_t(576) << 32 | 147, uint64_t(7)}, pos));
+    assert(!two.FindDraws({uint64_t(7), uint64_t(8)}, pos));
+}
+
 int main() {
+    TestSkyKeyAndMoonCache();
+    TestSkyCache();
     TestGiPipelineFlags();
     TestGiPipelineMode();
     TestGiSbt();

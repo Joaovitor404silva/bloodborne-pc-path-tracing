@@ -679,6 +679,20 @@ void TestStockGate() {
     draws[3].state.specular = 10;
     const LightTargets main = MainLightTargets(draws);
     assert(main.diffuse == 7 && main.specular == 8);
+    {
+        // A narrower capture pass with more light draws must not take the scene's targets.
+        std::vector<LightDrawRecord> two(5);
+        for (auto& d : two) {
+            d.state = main_state;
+            d.state.diffuse = 20;
+            d.state.specular = 21;
+            d.state.width = 512;
+        }
+        two[0].state = main_state;
+        two[0].state.width = 2560;
+        const LightTargets wide = MainLightTargets(two);
+        assert(wide.diffuse == 7 && wide.specular == 8 && wide.width == 2560);
+    }
     assert(!StockLightGate(main_state, main).reason);
     assert(!StockLightGate(LightDrawState{}, main).reason);
     LightGate g = StockLightGate(draws[3].state, main);

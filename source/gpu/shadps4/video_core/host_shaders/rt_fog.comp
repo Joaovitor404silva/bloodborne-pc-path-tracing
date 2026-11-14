@@ -183,6 +183,15 @@ float Rand(uvec2 pixel, uint salt) {
            16777216.0;
 }
 
+// Per-pixel start offset that walks the golden-ratio sequence over frames: successive frames
+// cover the step interval evenly, so the 0.9 history averages a stratified march instead of
+// white-noise offsets (far fog boiled in blotches with 4 steps).
+float StepOffset(uvec2 pixel, uint salt) {
+    const float base = float(Hash(pixel.x * 1973u + pixel.y * 9277u + salt * 26699u) & 0xFFFFFFu) /
+                       16777216.0;
+    return fract(base + float(Frame() & 4095u) * 0.6180339887);
+}
+
 #if !defined(RT_FOG_APPLY) && !defined(RT_FOG_OPAQUE)
 
 struct SurfaceRecord {
@@ -190,6 +199,7 @@ struct SurfaceRecord {
     uint flags;
     uint uv_base;
     float alpha_ref;
+    uint flags2;
 };
 
 layout(binding = 7, std430) readonly buffer Surfaces {
@@ -244,7 +254,7 @@ float Visibility(vec3 origin, vec3 dir, float far_t) {
     const float alpha_t = min(AlphaDistance(), far_t);
     rayQueryEXT q;
     rayQueryInitializeEXT(q, accelerationStructureEXT(tlas_count_flags.xy),
-                          gl_RayFlagsTerminateOnFirstHitEXT, 0xEFu, TlasPoint(tlas_count_flags.xy, origin), 0.05, TlasDir(tlas_count_flags.xy, dir), alpha_t);
+                          gl_RayFlagsTerminateOnFirstHitEXT, 0x6Fu, TlasPoint(tlas_count_flags.xy, origin), 0.05, TlasDir(tlas_count_flags.xy, dir), alpha_t);
     float t = 1.0;
     while (rayQueryProceedEXT(q)) {
         if (rayQueryGetIntersectionTypeEXT(q, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
@@ -574,7 +584,26 @@ vec3 LampScatter(vec3 x, vec3 dir, uvec2 q, uint salt) {
     return chosen_e * (wsum / chosen_w) * vis * PhaseFor(dot(dir, ldir));
 }
 
+// Brightest moon luma over this frame's directional sets: the lamp reference for every pixel.
+// A pixel whose set has no moon fell back to the sky reference (~12x smaller in the Forbidden
+// Woods), so fire-lit fog flared in bright blobs shaped like the grass using that set.
+shared uint s_moon_luma;
+
 void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        s_moon_luma = 0u;
+    }
+    barrier();
+    const uint set_count = (Flags() & FlagSets) != 0u ? min(tlas_count_flags.z, 1024u) : 0u;
+    for (uint i = gl_LocalInvocationIndex; i < set_count; i += 64u) {
+        const vec3 Li = MoonDir(i);
+        const float li = dot(Li, Li) > 0.0 ? dot(MoonColor(i), vec3(0.29891, 0.58661, 0.11448)) : 0.0;
+        if (li > 0.0 && li < 1.0e30) {
+            atomicMax(s_moon_luma, floatBitsToUint(li));
+        }
+    }
+    barrier();
+    const float frame_moon_luma = uintBitsToFloat(s_moon_luma);
     const ivec2 q = ivec2(gl_GlobalInvocationID.xy);
     const ivec2 qsize = (ivec2(Size()) + int(Scale) - 1) / int(Scale);
     if (any(greaterThanEqual(q, qsize))) {
@@ -599,7 +628,7 @@ void main() {
     if (FogSetAt(set_id, dist, col, height, hcol) && dist.x > 0.0 && dist.z > 0.0) {
         const uint steps = Steps();
         const float ds = march_dist / float(steps);
-        const float offset = Rand(uvec2(q), 1u);
+        const float offset = StepOffset(uvec2(q), 1u);
         const float phase_v = PhaseFor(dot(dir, L));
         const bool lamps = (LightFlags() & LightLamps) != 0u && LampScale() > 0.0;
         const bool sky = (LightFlags() & LightSky) != 0u && SkyScale() > 0.0;
@@ -636,7 +665,7 @@ void main() {
         const float remainder = max(t - t_end, 0.0);
         if (remainder > 1e-4) {
             const uint far_steps = 2u;
-            const float far_offset = Rand(uvec2(q), 3u);
+            const float far_offset = StepOffset(uvec2(q), 3u);
             for (uint i = 0u; i < far_steps; ++i) {
                 const float u = (float(i) + far_offset) / float(far_steps);
                 const float target = max(t - u * remainder, 1e-30);
@@ -703,17 +732,20 @@ void main() {
         const float c_luma = dot(c, lw);
         vec3 moon_part, lamp_part, sky_part;
         float used_ref = ref;
+        const float lamp_ref = share > 0.0 && frame_moon_luma > 0.0
+                                   ? frame_moon_luma / (4.0 * Pi * share)
+                                   : ref;
         if (share > 0.0 && c_luma > 0.0) {
             used_ref = c_luma / (4.0 * Pi * share);
             moon_part = share * scatter * phase_v;
-            lamp_part = col.rgb * LampScale() * lamp_sum / (4.0 * Pi * used_ref);
+            lamp_part = col.rgb * LampScale() * lamp_sum / (4.0 * Pi * lamp_ref);
             const float sky_vis = sky && sky_ref > 1e-3 && dot(mean_sky, mean_sky) > 0.0
                                       ? SkyScale() * dot(sky_sum, lw) / sky_ref
                                       : w_sum;
             sky_part = (1.0 - share) * col.rgb * sky_vis;
         } else {
             moon_part = scatter * phase_v * c / (4.0 * Pi * ref);
-            lamp_part = col.rgb * LampScale() * lamp_sum / (4.0 * Pi * ref);
+            lamp_part = col.rgb * LampScale() * lamp_sum / (4.0 * Pi * lamp_ref);
             sky_part = col.rgb * SkyScale() * sky_sum / ref;
         }
         const uint debug = Debug();
@@ -753,8 +785,30 @@ void main() {
             const ivec2 pq = ivec2(floor((ViewToPixel(prev, prev_proj, prev_jitter.xy) + 0.5) / float(Scale)));
             if (all(greaterThanEqual(pq, ivec2(0))) && all(lessThan(pq, qsize))) {
                 history_used = 0.75;
-                const vec4 h = texelFetch(fog_prev, pq, 0);
-                const float dz = abs(h.w - prev.z) / max(abs(prev.z), 1e-3);
+                vec4 h = texelFetch(fog_prev, pq, 0);
+                float dz = abs(h.w - prev.z) / max(abs(prev.z), 1e-3);
+                // The 4x4 sub-pixel phase moves this sample across depth edges (far branches)
+                // every frame: when the centre texel is the other side of the edge, take the
+                // best-matching neighbour instead of restarting from one noisy frame.
+                if (!(dz < 0.1) || any(isnan(h.xyz))) {
+                    float best = 1.0e9;
+                    for (int j = -1; j <= 1; ++j) {
+                        for (int i = -1; i <= 1; ++i) {
+                            const ivec2 t = pq + ivec2(i, j);
+                            if ((i == 0 && j == 0) || any(lessThan(t, ivec2(0))) ||
+                                any(greaterThanEqual(t, qsize))) {
+                                continue;
+                            }
+                            const vec4 n = texelFetch(fog_prev, t, 0);
+                            const float nz = abs(n.w - prev.z) / max(abs(prev.z), 1e-3);
+                            if (nz < best && all(not(isnan(n.xyz)))) {
+                                best = nz;
+                                h = n;
+                            }
+                        }
+                    }
+                    dz = best;
+                }
                 if (dz < 0.1 && all(not(isnan(h.xyz)))) {
                     history_used = 1.0;
                     result.xyz = mix(h.xyz, result.xyz, 0.1);

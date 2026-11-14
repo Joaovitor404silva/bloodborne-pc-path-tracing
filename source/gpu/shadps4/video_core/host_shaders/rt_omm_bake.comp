@@ -21,7 +21,29 @@ layout(push_constant) uniform Constants {
     uint texture_slot;
     uint level;
     float alpha_ref;
+    uint alpha_channel;
 };
+
+// Each sample reads the mip whose texel spans the sample spacing, so it averages its whole patch
+// instead of one texel: a thin gap or bar between two point samples still shows. A micro-triangle
+// is solid or open only when every sample is clearly past alpha_ref (ClassMargin); anything near
+// the edge stays unknown and the ray's any-hit runs the exact per-texel test. Point samples at mip
+// 0 marked whole micro-triangles of fences and branches solid or open, so their shadows came out
+// in staircase blocks.
+const float ClassMargin = 0.2;
+float BakeLod;
+
+float SampleAlpha(vec2 uv) {
+    return textureLod(surface_textures[nonuniformEXT(texture_slot)], uv, BakeLod)[alpha_channel & 3u];
+}
+
+// 1 solid, 0 open, 2 near the edge (both bits set by the caller).
+uint Classify(float alpha) {
+    if (alpha >= min(alpha_ref + ClassMargin, 0.99)) {
+        return 1u;
+    }
+    return alpha < max(alpha_ref - ClassMargin, 0.01) ? 0u : 2u;
+}
 
 uint CurveIndex(float u, float v, uint lvl) {
     u = clamp(u, 0.0, 1.0);
@@ -88,20 +110,26 @@ void main() {
     const uint n = 1u << (level + 2u);
     bool any_opaque = false, any_transparent = false;
     const bool textured = texture_slot != 0u && texture_slot < MaxSurfaceTextures;
+    BakeLod = 0.0;
+    if (textured) {
+        const vec2 size = vec2(textureSize(surface_textures[nonuniformEXT(texture_slot)], 0));
+        const float edge = max(max(length((uv1 - uv0) * size), length((uv2 - uv0) * size)),
+                               length((uv2 - uv1) * size));
+        BakeLod = max(0.0, log2(max(edge / float(n), 1.0)));
+    }
     if (level <= 3u) {
         for (uint j = 0u; j < n; ++j) {
             for (uint i = 0u; i + j < n; ++i) {
                 const float u = (float(i) + 0.5) / float(n);
                 const float v = (float(j) + 0.5) / float(n);
                 const vec2 uv = uv0 * (1.0 - u - v) + uv1 * u + uv2 * v;
-                const float alpha = textured
-                    ? textureLod(surface_textures[nonuniformEXT(texture_slot)], uv, 0.0).a
-                    : 1.0;
+                const uint c = textured ? Classify(SampleAlpha(uv)) : 1u;
                 const uint k = CurveIndex(u, v, level);
                 const uint bit = 1u << (k & 31u);
-                if (alpha >= alpha_ref) {
+                if (c != 0u) {
                     if (k < 32u) opaque_lo |= bit; else opaque_hi |= bit;
-                } else {
+                }
+                if (c != 1u) {
                     if (k < 32u) trans_lo |= bit; else trans_hi |= bit;
                 }
             }
@@ -135,10 +163,9 @@ void main() {
                             continue;
                         }
                         const vec2 uv = uv0 * (1.0 - u - v) + uv1 * u + uv2 * v;
-                        const float alpha = textured
-                            ? textureLod(surface_textures[nonuniformEXT(texture_slot)], uv, 0.0).a
-                            : 1.0;
-                        if (alpha >= alpha_ref) o = 1u; else tr = 1u;
+                        const uint c = textured ? Classify(SampleAlpha(uv)) : 1u;
+                        if (c != 0u) o = 1u;
+                        if (c != 1u) tr = 1u;
                     }
                 }
                 const uint state = (o == 1u && tr == 0u) ? 1u : (tr == 1u && o == 0u) ? 0u : 3u;

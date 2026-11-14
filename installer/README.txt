@@ -1,4 +1,4 @@
-Bloodborne PC - Path Tracing mod (pt2.2)
+Bloodborne PC - Path Tracing mod (pt2.3)
 ========================================
 
 Real-time path tracing for SuperMedo's Bloodborne PC port: moonlight, bounce light,
@@ -9,8 +9,8 @@ along with effects (fire, fog, glows), water and the overall look. Expect bugs, 
 that look wrong, and big changes between versions.
 
 NEEDS
-- Bloodborne PC 1.9.8.4 (SuperMedo), already installed and working:
-  https://github.com/Supermedo/bloodborne_pc/releases/tag/windows-v1.9.8.4
+- Bloodborne PC 1.9.8.6 (SuperMedo), already installed and working:
+  https://github.com/Supermedo/bloodborne_pc/releases/tag/windows-v1.9.8.6
 - A ray tracing GPU (GeForce RTX, Radeon RX 6000 or newer). Use DLSS or FSR.
 
 INSTALL
@@ -37,7 +37,7 @@ antivirus), the installer puts every file back and says what failed.
 
 UNINSTALL
 Double-click "Uninstall Path Tracing.bat": the backup goes back, the Ray Reconstruction
-DLL and the launcher variables are removed, and the folder is stock 1.9.8.4 again.
+DLL and the launcher variables are removed, and the folder is stock 1.9.8.6 again.
 
 UPSCALER
 Path tracing was not tested with FSR 4.1 (the launcher's automatic pick). If your

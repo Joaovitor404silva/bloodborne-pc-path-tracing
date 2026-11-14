@@ -38,6 +38,15 @@ constexpr uint32_t DirectFlagPortals = 1024; // portal panes in the TLAS this fr
 constexpr uint32_t DirectFlagMoonHalf = 2048;
 constexpr uint32_t DirectFlagMoonHalfAlt = 4096;
 constexpr uint32_t DirectFlagWaterKeep = 8192;
+constexpr uint32_t DirectFlagMoonHistory = 16384;      // rt_direct.comp MoonHistory runs
+constexpr uint32_t DirectFlagMoonHistoryValid = 32768; // last frame's history fits this camera
+constexpr uint32_t DirectFlagObjectMotion = 65536;     // binding 19 holds this frame's object motion
+// rt_direct.comp KeptProbe: grid camera rays report what lies in front of the drawn surface in
+// pick ring word KeptProbeBase (count) and the KeptProbeMax words after it (TLAS indices).
+constexpr uint32_t DirectFlagKeptProbe = 131072;
+constexpr uint32_t KeptProbeBase = 128;
+constexpr uint32_t KeptProbeMax = 127;
+constexpr uint32_t KeptProbeBytes = (KeptProbeBase + 1 + KeptProbeMax) * 4;
 
 constexpr uint32_t MoonHalfFlags(uint32_t knob, bool moon_mask, uint32_t debug) {
     if (knob == 0 || moon_mask || debug != 0) {
@@ -593,7 +602,7 @@ inline uint32_t BuildHalos(std::span<const DirectLightGpu> lights,
 // it back to the game's radius (a wall lamp's light stopped at its 2 m sphere instead of reaching
 // through a glass door, hot103). Candles keep the test: their look was approved with it.
 inline bool PackStockDepth(DirectLightGpu& g, const Light& l) {
-    if (g.spec_kind[3] != 0.0f || l.age != 0 || l.lamp) {
+    if (g.spec_kind[3] != 0.0f || l.age != 0 || l.lamp || l.wide) {
         return false;
     }
     const StockDepthTest t = LightDepthTest(l.state);
@@ -742,6 +751,11 @@ struct LightKeepView {
     uint32_t offscreen_frames{};
     bool valid{};
     bool reproject{true};
+    // The scene camera (the one RT renders with) for the frustum test. Looking straight down, the
+    // camera in the game's light draws is not the scene camera (a player fill light 3 m from the
+    // camera read 62.8 m away), so lights and glow lamps behind the player were culled by it.
+    Affine cull_view{};
+    bool cull_valid{};
 };
 
 inline bool SphereInFrustum(const std::array<float, 3>& p, float r, float xs, float ys) {
@@ -770,7 +784,8 @@ inline bool KeepOffscreenLight(const DirectTrack& t, uint64_t frame_no, uint32_t
     if (t.light.emitter && !t.light.held && !t.mobile && t.frames >= DirectKeepMinFrames) {
         return true;
     }
-    return !SphereInFrustum(Transform(kv.view, t.light.world), t.light.radius, kv.xs, kv.ys);
+    return !SphereInFrustum(Transform(kv.cull_valid ? kv.cull_view : kv.view, t.light.world),
+                            t.light.radius, kv.xs, kv.ys);
 }
 
 inline std::array<float, 16> ReprojectCone(const std::array<float, 16>& cone, const Affine& a) {

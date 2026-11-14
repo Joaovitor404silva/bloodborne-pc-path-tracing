@@ -1,6 +1,7 @@
 #include "video_core/renderer_vulkan/rt/vk_ray_tracing.h"
 #include "bbport_stdout.h"
 #include "video_core/renderer_vulkan/rt/rt_hitch.h"
+#include "video_core/renderer_vulkan/vk_object_motion.h"
 #include "video_core/renderer_vulkan/rt/rt_address_map.h"
 
 #include <algorithm>
@@ -12,6 +13,7 @@
 #include <cstdlib>
 #include <condition_variable>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <span>
 #include <string>
@@ -19,6 +21,8 @@
 #include <unordered_set>
 
 #include <vk_mem_alloc.h>
+#include <xxhash.h>
+#include <fstream>
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/host_shaders/rt_debug_comp.h"
 #include "video_core/host_shaders/rt_gather_comp.h"
@@ -26,6 +30,7 @@
 #include "video_core/host_shaders/rt_gi_apply_comp.h"
 #include "video_core/host_shaders/rt_gi_comp.h"
 #include "video_core/host_shaders/rt_light_vis_comp.h"
+#include "video_core/host_shaders/rt_sky_layer_comp.h"
 #include "video_core/host_shaders/rt_reflect_comp.h"
 #include "video_core/host_shaders/rt_sharc_comp.h"
 #include "video_core/host_shaders/rt_restir_gi_init_comp.h"
@@ -45,6 +50,9 @@
 #include "video_core/host_shaders/rt_fog_apply_comp.h"
 #include "video_core/host_shaders/rt_fog_opaque_comp.h"
 #include "video_core/host_shaders/rt_sky_comp.h"
+#include "video_core/host_shaders/rt_exposure_comp.h"
+#include "video_core/host_shaders/rt_world_set_comp.h"
+#include "video_core/host_shaders/rt_moon_dir_comp.h"
 #include "video_core/host_shaders/rt_direct_comp.h"
 #include "video_core/host_shaders/rt_ao_comp.h"
 #include "video_core/host_shaders/rt_restir_spatial_comp.h"
@@ -79,6 +87,7 @@ const char* HotShaderName(const u32* code) {
         {RT_RESTIR_GI_INIT_COMP, "rt_restir_gi_init_comp"},
         {RT_RESTIR_GI_RESOLVE_COMP, "rt_restir_gi_resolve_comp"},
         {RT_LIGHT_VIS_COMP, "rt_light_vis_comp"},
+        {RT_SKY_LAYER_COMP, "rt_sky_layer_comp"},
         {RT_RESTIR_GI_TEMPORAL_COMP, "rt_restir_gi_temporal_comp"},
         {RT_RESTIR_GI_SPATIAL_COMP, "rt_restir_gi_spatial_comp"},
         {RT_SHADOW_COMP, "rt_shadow_comp"},
@@ -86,6 +95,9 @@ const char* HotShaderName(const u32* code) {
         {RT_FOG_APPLY_COMP, "rt_fog_apply_comp"},
         {RT_FOG_OPAQUE_COMP, "rt_fog_opaque_comp"},
         {RT_SKY_COMP, "rt_sky_comp"},
+        {RT_EXPOSURE_COMP, "rt_exposure_comp"},
+        {RT_WORLD_SET_COMP, "rt_world_set_comp"},
+        {RT_MOON_DIR_COMP, "rt_moon_dir_comp"},
         {RT_DIRECT_COMP, "rt_direct_comp"},
         {RT_AO_COMP, "rt_ao_comp"},
         {RT_RESTIR_TEMPORAL_COMP, "rt_restir_temporal_comp"},
@@ -117,11 +129,12 @@ struct OmmConstants {
     u32 data_word_offset;
     u32 record_word_offset;
     u32 index_word_offset;
-    u32 texture_slot;
+    u32 texture_slot; // the slot the shadow rays' alpha test reads (SurfaceAlphaTexture)
     u32 level;
     float alpha_ref;
+    u32 alpha_channel; // and its channel (SurfaceAlphaChannel)
 };
-static_assert(sizeof(OmmConstants) == 32);
+static_assert(sizeof(OmmConstants) == 36);
 
 constexpr u64 OmmAlign = 256;
 
@@ -188,6 +201,33 @@ struct SharcPush {
 };
 static_assert(sizeof(SharcPush) == 16);
 
+// rt_world_set.comp: the moon set vote, written as set + 1 into one word of a GiParams slot.
+struct WorldSetPush {
+    float width, height;
+    u32 set_count;
+    u32 word;
+};
+static_assert(sizeof(WorldSetPush) == 16);
+// GiParams.sharc.w, read by rt_gi.comp WorldSet().
+constexpr u32 WorldSetWord = u32((offsetof(Rt::GiParams, sharc) + 12) / 4);
+
+// rt_moon_dir.comp: light 1 of each set in the set copy points at the sky's moon.
+struct MoonDirPush {
+    u32 set_count;
+    u32 moon_slot;
+    u32 pad0, pad1;
+};
+static_assert(sizeof(MoonDirPush) == 16);
+
+// rt_exposure.comp push constants.
+struct ExposurePush {
+    std::array<float, 4> size_cfg; // width, height, phase, apply
+    std::array<float, 4> params;   // key, max stops, rate, reset
+    std::array<float, 4> tone;     // white level (stops above the key)
+};
+static_assert(sizeof(ExposurePush) == 48);
+constexpr u32 ExposureSlotBytes = 64;
+
 // rt_gi.comp RT_LIGHT_VIS push constants (VisPush).
 struct FillVisPush {
     u32 count;
@@ -198,6 +238,18 @@ struct FillVisPush {
     float smoke;
 };
 static_assert(sizeof(FillVisPush) == 24);
+
+// rt_gi.comp RT_SKY_LAYER push constants (SkyLayerPush).
+struct SkyLayerPush {
+    u32 layer_base;
+    u32 moon_slot;
+    u32 phase;
+    float moon_min;
+    std::array<float, 4> moon_seed;
+    u32 moon_reset;
+    u32 pad[3];
+};
+static_assert(sizeof(SkyLayerPush) == 48);
 
 // rt_gi.comp (RT_REFLECT) GlassPush.
 struct GlassPush {
@@ -225,8 +277,10 @@ struct GlassPush {
     float body;
     float sheen;
     float sheen_far;
+    float puddle_edge;
+    float puddle_wet;
 };
-static_assert(sizeof(GlassPush) == 96);
+static_assert(sizeof(GlassPush) == 104);
 constexpr u32 GlassOn = 1, GlassDebugMask = 2, GlassDebugCandidates = 4, GlassIrr = 8,
               GlassAlbedo = 16, GlassKeep = 32, WaterOn = 64, WaterDebugMask = 128, WaterAtFloor = 256,
               ReflectSkyDome = 512, WaterSheets = 1024, WaterPuddles = 2048;
@@ -539,6 +593,9 @@ RayTracing::RayTracing(const Instance& instance_, Scheduler& scheduler_, Runtime
         return;
     }
     Rt::LiveKnobs().Open(std::getenv("BB_RT_CFG"));
+    if (const char* cfg = std::getenv("BB_RT_CFG"); cfg && cfg[0]) {
+        glass_mask_dir = (std::filesystem::path(cfg).parent_path() / "glass_masks").string();
+    }
     if (Rt::LiveKnobs().Poll()) {
         Log("Ray tracing: live config %s read (%zu keys, polled every 30 frames)\n",
             Rt::LiveKnobs().Path().c_str(), Rt::LiveKnobs().Values().size());
@@ -729,7 +786,7 @@ RayTracing::RayTracing(const Instance& instance_, Scheduler& scheduler_, Runtime
             "has lights, green bar = light count, blue = pass wrote, 5 strongest light blocker: black "
             "lit, blue forced opaque, cyan OMM opaque, red candidate without alpha test, green = "
             "sampled alpha, +red when it blocked, 6 AO mask alone, 7 light set id (set 0 red, top strip = set 0 moon colour x4), 8 strongest "
-            "point/spot light per pixel as its index colour, brightness = its share; BB_RT_DIRECT_LIGHT_LOG=<m> "
+            "point/spot light per pixel as its index colour, brightness = its share, 11 moon: green lit, black shadowed, blue faces away; BB_RT_DIRECT_LIGHT_LOG=<m> "
             "lists the lights within m metres of the camera once a second), "
             "visibility %s (BB_RT_DIRECT_NOVIS), moon shadow %s (BB_RT_MOON=trace|mask, BB_RT_MOON_ANGLE tenths of a degree), moon ray sample %s (BB_RT_MOON_SEED=static|frame), directional set log %s (BB_RT_DIR_LOG), depth-only draws %s (BB_RT_DEPTH_DRAWS); directional sets copied at the game's light draw of the same frame, never averaged across frames because the game renumbers its sets per frame (BB_RT_DIR_SETS=snap|gpu|host)\n",
             direct_rays, direct_keep, direct_g1_target, shadow_spec_target, direct_debug,
@@ -920,7 +977,8 @@ void RayTracing::DestroyFogImages() {
     fog_width = fog_height_px = 0;
 }
 
-bool RayTracing::MakeOwnImage(OwnImage& own, vk::Format format, u32 width, u32 height) {
+bool RayTracing::MakeOwnImage(OwnImage& own, vk::Format format, u32 width, u32 height,
+                              vk::ImageUsageFlags extra_usage) {
     const auto device = instance.GetDevice();
     own.image = VideoCore::UniqueImage(device, instance.GetAllocator());
     if (!own.image.TryCreate(vk::ImageCreateInfo{
@@ -931,7 +989,8 @@ bool RayTracing::MakeOwnImage(OwnImage& own, vk::Format format, u32 width, u32 h
             .arrayLayers = 1,
             .samples = vk::SampleCountFlagBits::e1,
             .tiling = vk::ImageTiling::eOptimal,
-            .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
+            .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+                     extra_usage,
             .initialLayout = vk::ImageLayout::eUndefined,
         })) {
         return false;
@@ -1128,7 +1187,8 @@ bool RayTracing::CreateResources() {
         !host_ring(instances_ring, capacity.records * sizeof(VkAccelerationStructureInstanceKHR),
                    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
-        !host_ring(params_ring, ParamsSlotBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
+        !host_ring(params_ring, ParamsSlotBytes,
+                   VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
         !host_ring(shadow_params_ring, ShadowParamsSlotBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
         !CreateFeatureRings(made) ||
         !host_ring(probes_ring, capacity.records * sizeof(ProbeRecord),
@@ -1337,7 +1397,7 @@ bool RayTracing::CreateFeatureRings(const Rt::LiveToggles& f) {
                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT) ||
           !host_ring(sets_readback_ring, Rt::DirectSetBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT))) ||
-        (f.direct && !host_ring(pick_ring, 512, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) ||
+        (f.direct && !host_ring(pick_ring, Rt::KeptProbeBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) ||
         (f.ao &&
          (!host_ring(ao_params_ring, AoParamsSlotBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
           !host_ring(ao_stats_ring, AoStatsSlotBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT))) ||
@@ -1349,9 +1409,12 @@ bool RayTracing::CreateFeatureRings(const Rt::LiveToggles& f) {
           !host_ring(gi_fog_ring, FogSetsSlotBytes,
                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT) ||
           !host_ring(fill_vis_ring, FillVisSlotBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
-          !host_ring(halo_ring, HaloSlotBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT))) ||
+          !host_ring(halo_ring, HaloSlotBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
+          !host_ring(moon_ring, MoonRingSlotBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT) ||
+          !host_ring(exposure_ring, ExposureSlotBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT))) ||
         (f.reflect &&
-         !host_ring(reflect_params_ring, ParamsSlotBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) ||
+         !host_ring(reflect_params_ring, ParamsSlotBytes,
+                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) ||
         (f.restir_gi &&
          !host_ring(restir_gi_params_ring, RestirParamsSlotBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT))) {
         return false;
@@ -1361,7 +1424,8 @@ bool RayTracing::CreateFeatureRings(const Rt::LiveToggles& f) {
         for (DeviceBuffer* buffer : {&material, &material_accum}) {
             if (!buffer->buffer &&
                 !CreateRawBuffer(instance, buffer->size,
-                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                  false, 16, buffer->buffer, buffer->allocation, nullptr,
                                  buffer->address)) {
                 return false;
@@ -1377,6 +1441,7 @@ void RayTracing::DestroyResources() {
     surface_made = false;
     DestroySurfaceResources();
     DestroyReservoirs();
+    DestroyMoonHistory();
     cache.Clear([](const Rt::CacheEntry&) {});
     entry_handles.clear();
     entry_addresses.clear();
@@ -1421,12 +1486,19 @@ void RayTracing::DestroyResources() {
                            &direct_sets_ring, &gi_lights_ring, &gi_sets_ring, &gi_fog_ring,
                            &reflect_params_ring, &restir_remap_ring, &restir_gi_params_ring,
                            &ao_params_ring, &ao_stats_ring, &fog_params_ring, &pick_ring,
-                           &smoke_ring, &fill_vis_ring, &halo_ring}) {
+                           &smoke_ring, &fill_vis_ring, &halo_ring, &moon_ring,
+                           &exposure_ring}) {
         if (ring->buffer) {
             vmaDestroyBuffer(allocator, ring->buffer, ring->allocation);
             ring->buffer = vk::Buffer{};
             ring->mapped = nullptr;
         }
+    }
+    if (sky_io_buffer) {
+        vmaDestroyBuffer(allocator, sky_io_buffer, sky_io_allocation);
+        sky_io_buffer = vk::Buffer{};
+        sky_io_mapped = nullptr;
+        sky_io = SkyIo::Idle;
     }
     DestroyAoImages();
     ao_pipeline.reset();
@@ -1468,9 +1540,44 @@ void RayTracing::DestroyReservoirs() {
     reservoir_width = reservoir_height = 0;
 }
 
+bool RayTracing::CreateMoonHistory(u32 width, u32 height) {
+    DestroyMoonHistory();
+    const u64 bytes = u64(width) * height * 8u;
+    for (DeviceBuffer& buffer : moon_hist) {
+        buffer.size = bytes;
+        if (!CreateRawBuffer(instance, bytes,
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                             false, 16, buffer.buffer, buffer.allocation, nullptr, buffer.address)) {
+            DestroyMoonHistory();
+            return false;
+        }
+    }
+    moon_hist_width = width;
+    moon_hist_height = height;
+    moon_hist_index = 0;
+    moon_hist_frame = ~0ull;
+    Log("Ray tracing: moon visibility history %ux%u (%llu MiB)\n", width, height,
+        (unsigned long long)((bytes * 2) >> 20));
+    return true;
+}
+
+void RayTracing::DestroyMoonHistory() {
+    if (moon_hist_width) {
+        scheduler.Finish();
+    }
+    const auto allocator = instance.GetAllocator();
+    for (DeviceBuffer& buffer : moon_hist) {
+        if (buffer.buffer) {
+            vmaDestroyBuffer(allocator, buffer.buffer, buffer.allocation);
+            buffer.buffer = vk::Buffer{};
+        }
+    }
+    moon_hist_width = moon_hist_height = 0;
+}
+
 void RayTracing::ReadLiveKnobs() {
     reflect_max_rough = EnvFloat("BB_RT_REFLECT_MAX_ROUGH", Rt::ReflectMaxRoughDefault, 0.0f, 1.0f);
-    direct_debug = u32(EnvU64("BB_RT_DIRECT_DEBUG", 0, 0, 10));
+    direct_debug = u32(EnvU64("BB_RT_DIRECT_DEBUG", 0, 0, 11));
     // Live: instance opacity is set every frame, so cut-outs of skinned draws can be A/B'd.
     skin_alpha = EnvU64("BB_RT_SKIN_ALPHA", 1, 0, 1) != 0;
     direct_light_log = EnvFloat("BB_RT_DIRECT_LIGHT_LOG", 0.0f, 0.0f, 1000.0f);
@@ -1506,15 +1613,36 @@ void RayTracing::ReadLiveKnobs() {
     const char* moon_env = Rt::Knob("BB_RT_MOON");
     moon_mask = moon_env && std::strcmp(moon_env, "mask") == 0;
     moon_cone_cos = Rt::MoonConeCos(float(EnvU64("BB_RT_MOON_ANGLE", 15, 0, 100)) * 0.1f);
+    // Lowest moonlight elevation in degrees (rt_moon_dir.comp; 0 = the sky moon as drawn).
+    moon_min_elevation = EnvFloat("BB_RT_MOON_MIN_EL", 0.0f, 0.0f, 80.0f);
+    // 1: the white spot of the traced moon layer mesh also counts as a moon find. Off: only the
+    // moon drawn on screen (rt_sky.comp FindScreenMoon); the late-game layer spot sat 30 degrees
+    // from the drawn disc.
+    moon_layer_find = EnvU64("BB_RT_MOON_LAYER_FIND", 0, 0, 1) != 0;
     {
         const char* seed = Rt::Knob("BB_RT_MOON_SEED");
         moon_static = !seed || std::strcmp(seed, "frame") != 0;
         moon_world = EnvU64("BB_RT_MOON_WORLD", 1, 0, 1) == 1;
     }
     moon_half = u32(EnvU64("BB_RT_MOON_HALF", 2, 0, 2));
+    moon_history = EnvU64("BB_RT_MOON_HISTORY", 1, 0, 1) != 0;
+    moon_object_motion = EnvU64("BB_RT_MOON_OBJECT_MOTION", 1, 0, 1) != 0;
     restir_gi_jacobian = EnvFloat("BB_RT_RESTIR_GI_JACOBIAN", Rt::RestirGiJacobianDefault, 0.0f, 1000.0f);
     dir_log = EnvU64("BB_RT_DIR_LOG", 0, 0, 1) == 1;
     dir_dump = EnvU64("BB_RT_DIR_DUMP", 0, 0, 1) == 1;
+    gi_world_set = !Rt::KnobIs("BB_RT_GI_WORLD_SET", '0');
+    moon_from_sky = !Rt::KnobIs("BB_RT_MOON_FROM_SKY", '0');
+    moon_min = EnvFloat("BB_RT_MOON_MIN", 0.2f, 0.0f, 100.0f);
+    {
+        const bool was = exposure_on;
+        exposure_on = !Rt::KnobIs("BB_RT_EXPOSURE", '0');
+        exposure_reset = exposure_reset || was != exposure_on;
+    }
+    exposure_key = EnvFloat("BB_RT_EXPOSURE_KEY", ExposureKeyDefault, -20.0f, 20.0f);
+    exposure_max = EnvFloat("BB_RT_EXPOSURE_MAX", 1.5f, 0.0f, 6.0f);
+    exposure_rate = EnvFloat("BB_RT_EXPOSURE_RATE", 0.03f, 0.001f, 1.0f);
+    exposure_white = EnvFloat("BB_RT_EXPOSURE_WHITE", 3.0f, 0.5f, 12.0f);
+    thin_transmit = EnvFloat("BB_RT_THIN_TRANSMIT", 0.4f, 0.0f, 1.0f);
     const char* depth_draws_env = Rt::Knob("BB_RT_DEPTH_DRAWS");
     depth_only_draws = depth_draws_env && depth_draws_env[0] == '1';
     pick_enabled = Rt::ParsePick(Rt::Knob("BB_RT_PICK"), pick_at);
@@ -1572,11 +1700,31 @@ void RayTracing::ReadLiveKnobs() {
     // the emissive target) keep their light. 0 = off.
     fill_vis_flicker = EnvFloat("BB_RT_FILL_FLICKER", 0.01f, 0.0f, 1.0f);
     fill_vis_warm = !Rt::KnobIs("BB_RT_FILL_WARM", '0');
+    // Lamp hue for the warm rule: blue >= this x red (Rt::WarmLampBlue), unless fire-bright.
+    // 0 = any warm light (the old rule).
+    fill_vis_warm_hue = EnvFloat("BB_RT_FILL_WARM_HUE", Rt::WarmLampBlue, 0.0f, 0.6f);
     // Emitters found by the fill pass get inverse-square falloff out to radius x this (<= 1 off).
     // One cut for every emitter: the light ends where colour x s2 / d2 falls to 0.025 x colour,
     // i.e. reach = radius x source_frac / sqrt(0.025): 1.26 for BB_RT_EMITTER_SOURCE 0.2 and 3.8
     // for BB_RT_LAMP_SOURCE 0.6 (was 2.5 / 6: a hand torch lit 21 m, stock 8.5 m).
     emitter_range = EnvFloat("BB_RT_EMITTER_RANGE", 1.26f, 0.0f, 16.0f);
+    // A brighter fire reaches further: inverse-square light falls to the same cut-off level at a
+    // distance growing with sqrt(intensity), so an emitter brighter than this game colour (max
+    // channel; lanterns and torches are 2.0) gets its reach x sqrt(colour / this). The burning
+    // house's fires (12.8) stopped at 9.5 m like a lantern and left the garden moon-blue.
+    // 0 = off. Lamps and candles keep their own reach.
+    emitter_bright = EnvFloat("BB_RT_EMITTER_BRIGHT", 2.0f, 0.0f, 100.0f);
+    // A big fire flickers harder: the steady-flame flicker of such an emitter is
+    // BB_RT_EMITTER_STEADY_FLICKER x grow^this (grow = sqrt(colour / BB_RT_EMITTER_BRIGHT)).
+    // The burning house's lights are constant in the game; at x1 their light on the garden
+    // varied 3% (sd) against stock's 10%. 0 = same as a candle.
+    emitter_big_flicker = EnvFloat("BB_RT_EMITTER_BIG_FLICKER", 0.5f, 0.0f, 4.0f);
+    // ... plus a faster octave (the noise at 3x the rate: ~0.75-5 Hz) of this weight, so the light
+    // dances with the flames drawn over it instead of only swelling. Big fires only; 0 = off.
+    emitter_big_fast = EnvFloat("BB_RT_EMITTER_BIG_FAST", 0.5f, 0.0f, 4.0f);
+    // Brightness of a big fire's light (grow > 1) x this; the user asked for the burning house a
+    // little brighter (2026-11-09). 1 = the game's colour.
+    emitter_big_gain = EnvFloat("BB_RT_EMITTER_BIG_GAIN", 1.5f, 0.0f, 8.0f);
     // Source size of a converted emitter as a fraction of the game's radius, and how far (m, world
     // +y) the light moves up from the game's anchor in the holder towards the flame.
     emitter_source = EnvFloat("BB_RT_EMITTER_SOURCE", 0.2f, 0.01f, 1.0f);
@@ -1599,6 +1747,11 @@ void RayTracing::ReadLiveKnobs() {
     // Flicker of our own for flames the game keeps steady: x exp(this x Rt::FlameNoise), so 0.35
     // swings between x0.70 and x1.42 (at 0.9 linear the dips read as the light going out).
     emitter_steady_flicker = EnvFloat("BB_RT_EMITTER_STEADY_FLICKER", 0.35f, 0.0f, 1.0f);
+    // Below this mean |colour / running mean - 1| the game's own flicker counts as steady and the
+    // flame gets the flicker above (the fireplace swell measures 0.015; game-flickered flames 0.06+).
+    emitter_steady_dev = EnvFloat("BB_RT_EMITTER_STEADY_DEV", 0.05f, 0.0f, 1.0f);
+    // Sway (m) of fixed flames that are not lamps (candles, candelabra, fireplace).
+    fixed_sway = EnvFloat("BB_RT_FIXED_SWAY", 0.015f, 0.0f, 0.5f);
     // Largest game radius (m) of a fixed light that sways as a candle (candles 2 m, wall lamps 5).
     candle_rmax = EnvFloat("BB_RT_CANDLE_RMAX", 3.0f, 0.0f, 100.0f);
     // Source size and reach of fixed candles (game r up to BB_RT_CANDLE_RMAX, not lamps, not carried):
@@ -1667,10 +1820,38 @@ void RayTracing::ReadLiveKnobs() {
         // 8aba0ecd is NOT glass-only: it is a general building shader (ceilings, walls, 62 to
         // 59000-triangle meshes, hot105 picks); listed, the vaulted ceilings let the sky through
         // and looked like glass. The cracked door panes are 1c3953c6 (28-48 triangles).
-        glass_ps = Rt::ParseHashList(list ? list : "1c3953c6");
+        // ca7226ec: the workshop wardrobe and desk-cabinet door panes (85-triangle mesh, front and
+        // back faces 2 cm apart, gloss 0.75; 2026-11-09 pick). With BB_RT_GLASS_DEBUG=1 only those
+        // panes were accepted in the workshop.
+        // "hash:cap" gives one shader its own triangle cap. 1c3953c6 also draws the 110-triangle
+        // cloth on the workshop altar (gloss 0.88, 2026-11-09 pick): the cracked door panes are
+        // 28-48 triangles, so it is capped at 64.
+        glass_ps.clear();
+        glass_caps.clear();
+        for (const char* t = list ? list : "1c3953c6:64,ca7226ec"; t && *t;) {
+            char* end = nullptr;
+            const u64 hash = std::strtoull(t, &end, 16);
+            if (end == t) {
+                ++t;
+                continue;
+            }
+            t = end;
+            u32 cap = 0;
+            if (*t == ':') {
+                cap = u32(std::strtoul(t + 1, &end, 10));
+                t = end;
+            }
+            if (hash) {
+                glass_ps.push_back(hash);
+                glass_caps.push_back(cap);
+            }
+        }
     }
     // BB_RT_GLASS_PASS=0: glass instances stay opaque (rays stop at panes again).
     glass_pass = !Rt::KnobIs("BB_RT_GLASS_PASS", '0');
+    glass_mask_dump = Rt::KnobIs("BB_RT_GLASS_MASK_DUMP", '1');
+    glass_mask_by_uid.clear();
+    glass_mask_by_hash.clear(); // look at the mask files again (GlassMaskLoad)
     glass_gloss = EnvFloat("BB_RT_GLASS_GLOSS", 0.55f, 0.0f, 1.0f);
     water_on = !Rt::KnobIs("BB_RT_WATER", '0');
     water_layer = Rt::KnobIs("BB_RT_WATER_LAYER", '1');
@@ -1680,7 +1861,13 @@ void RayTracing::ReadLiveKnobs() {
         water_ps = Rt::ParseHashList(list ? list : "e54449c7");
     }
     water_rough = EnvFloat("BB_RT_WATER_ROUGH", 0.05f, 0.0f, 1.0f);
-    water_f0 = EnvFloat("BB_RT_WATER_F0", 0.5f, 0.0f, 1.0f);
+    // G-buffer puddles take real water's F0: at 0.5 (chosen for the dark sewer) a puddle seen from
+    // above mirrored half the bright sky and read as a white blob (Hunter's Dream path).
+    water_f0 = EnvFloat("BB_RT_WATER_F0", 0.02f, 0.0f, 1.0f);
+    // A puddle fades in over this much G-buffer gloss above 0.6 instead of a hard cut. 0 = hard.
+    water_puddle_edge = EnvFloat("BB_RT_PUDDLE_EDGE", 0.25f, 0.0f, 0.4f);
+    // The ground under a puddle keeps this share of its dry light (wet soil is darker). 1 = off.
+    water_puddle_wet = EnvFloat("BB_RT_PUDDLE_WET", 0.6f, 0.0f, 1.0f);
     water_sheet_depth = EnvFloat("BB_RT_WATER_SHEET_DEPTH", 0.03f, -1.0f, 10.0f);
     water_murk = EnvFloat("BB_RT_WATER_MURK", 5.0f, 0.0f, 100.0f);
     water_raise = EnvFloat("BB_RT_WATER_RAISE", 0.1f, 0.0f, 2.0f);
@@ -1801,7 +1988,9 @@ void RayTracing::ReadLiveKnobs() {
     direct_keep_offscreen = u32(EnvU64("BB_RT_DIRECT_KEEP_OFF", 1800, 0, 1000000));
     keep_rules.distance = EnvFloat("BB_RT_KEEP_DIST", 40.0f, 0.0f, 10000.0f);
     keep_rules.skinned_frames = EnvU64("BB_RT_KEEP_SKINNED", 30, 0, 1000000);
-    keep_rules.kept_unused_frames = EnvU64("BB_RT_KEEP_UNUSED", 3600, UnusedFrames, 10000000);
+    // Off-screen casters stay (user, 2026-11-12): at 3600 frames a building or lamp post behind
+    // the camera lost its moon shadow after a minute of standing still. Distance still drops them.
+    keep_rules.kept_unused_frames = EnvU64("BB_RT_KEEP_UNUSED", 10000000, UnusedFrames, 10000000);
     keep_rules.triangle_budget = EnvU64("BB_RT_KEEP_TRIS", 0, 0, 100000000);
     keep_rules.max_triangles = u32(EnvU64("BB_RT_KEEP_MAX_TRIS", 0, 0, 100000000));
     keep_gi = EnvU64("BB_RT_KEEP_GI", 0, 0, 1) != 0;
@@ -1811,8 +2000,12 @@ void RayTracing::ReadLiveKnobs() {
     off_switches.evict = EnvU64("BB_RT_OFF_EVICT", 1, 0, 1) != 0;
     off_switches.texresolve = EnvU64("BB_RT_OFF_TEXRESOLVE", 1, 0, 1) != 0;
     off_switches.holds = EnvU64("BB_RT_OFF_HOLDS", 1, 0, 1) != 0;
+    light_keep_scene = EnvU64("BB_RT_LIGHT_KEEP_SCENE", 1, 0, 1) != 0;
+    kept_probe = EnvU64("BB_RT_KEPT_PROBE", 1, 0, 1) != 0;
+    keep_rules.probe_hide = kept_probe;
     debug_mode = u32(EnvU64("BB_RT_DEBUG", 0, 0, 4));
     gi_strength = EnvFloat("BB_RT_GI_STRENGTH", 1.0f, 0.0f, 100.0f);
+    gi_fill_sky = EnvFloat("BB_RT_GI_FILL_SKY", 1.0f, 0.0f, 10.0f);
     gi_sky = EnvFloat("BB_RT_SKY", 0.0f, 0.0f, 100.0f);
     gi_clamp = EnvFloat("BB_RT_GI_CLAMP", 4.0f, 0.01f, 1e4f);
     gi_bias = EnvFloat("BB_RT_GI_BIAS", 0.02f, 0.0f, 10.0f);
@@ -2315,7 +2508,42 @@ bool RayTracing::CreatePipelines(const Rt::LiveToggles& f) {
                              sky_pipeline_layout, sky_pipeline)) {
         return false;
     }
-    const std::array<vk::DescriptorSetLayoutBinding, 14> direct_bindings = {{
+    const std::array<vk::DescriptorSetLayoutBinding, 4> world_set_bindings = {{
+        binding(0, Type::eSampledImage),
+        binding(1, Type::eSampledImage),
+        binding(2, Type::eStorageBuffer),
+        binding(3, Type::eStorageBuffer),
+    }};
+    if ((f.gi || f.reflect) && !world_set_pipeline &&
+        !make(world_set_bindings, sizeof(WorldSetPush), RT_WORLD_SET_COMP, world_set_layout,
+              world_set_pipeline_layout, world_set_pipeline)) {
+        Log("Ray tracing: world set vote unavailable (pipeline failed): GI/reflection hits use "
+            "each pixel's own directional set\n");
+        world_set_pipeline.reset();
+    }
+    const std::array<vk::DescriptorSetLayoutBinding, 2> moon_dir_bindings = {{
+        binding(0, Type::eStorageBuffer),
+        binding(1, Type::eStorageBuffer),
+    }};
+    if (sky_enabled && !moon_dir_pipeline &&
+        !make(moon_dir_bindings, sizeof(MoonDirPush), RT_MOON_DIR_COMP, moon_dir_layout,
+              moon_dir_pipeline_layout, moon_dir_pipeline)) {
+        Log("Ray tracing: moon direction from the sky unavailable (pipeline failed): light 1 "
+            "keeps the game's direction\n");
+        moon_dir_pipeline.reset();
+    }
+    const std::array<vk::DescriptorSetLayoutBinding, 3> exposure_bindings = {{
+        binding(0, Type::eSampledImage),
+        binding(1, Type::eStorageImage),
+        binding(2, Type::eStorageBuffer),
+    }};
+    if (f.gi && !exposure_pipeline &&
+        !make(exposure_bindings, sizeof(ExposurePush), RT_EXPOSURE_COMP, exposure_layout,
+              exposure_pipeline_layout, exposure_pipeline)) {
+        Log("Ray tracing: eye adaptation unavailable (pipeline failed)\n");
+        exposure_pipeline.reset();
+    }
+    const std::array<vk::DescriptorSetLayoutBinding, 17> direct_bindings = {{
         binding(0, Type::eSampledImage),
         binding(1, Type::eStorageImage),
         binding(2, Type::eStorageImage),
@@ -2330,6 +2558,9 @@ bool RayTracing::CreatePipelines(const Rt::LiveToggles& f) {
         binding(14, Type::eSampledImage),
         binding(15, Type::eStorageBuffer),
         binding(16, Type::eSampledImage),
+        binding(17, Type::eStorageBuffer),
+        binding(18, Type::eStorageBuffer),
+        binding(19, Type::eSampledImage),
     }};
     if (f.direct && !make(direct_bindings, 4, RT_DIRECT_COMP, direct_layout,
                                 direct_pipeline_layout, direct_pipeline, *surface_layout)) {
@@ -2473,6 +2704,13 @@ bool RayTracing::CreatePipelines(const Rt::LiveToggles& f) {
                   fill_vis_pipeline_layout, fill_vis_pipeline, *surface_layout)) {
             Log("Ray tracing: fill-light visibility off (pipeline failed)\n");
             fill_vis_pipeline.reset();
+        }
+        // The moon and cloud layer grid: the GI layout as is, its own push constants.
+        if (!make(gi_bindings, sizeof(SkyLayerPush), RT_SKY_LAYER_COMP, sky_layer_layout,
+                  sky_layer_pipeline_layout, sky_layer_pipeline, *surface_layout)) {
+            Log("Ray tracing: sky layer off (pipeline failed): light 1 keeps the game's "
+                "direction\n");
+            sky_layer_pipeline.reset();
         }
         if (!make(std::span<const vk::DescriptorSetLayoutBinding>{}, sizeof(SharcPush), RT_SHARC_COMP,
                   sharc_layout, sharc_pipeline_layout, sharc_pipeline)) {
@@ -3515,9 +3753,11 @@ void RayTracing::AddGlowLights(const Rt::Affine* view) {
     }
     if (Rt::KnobIs("BB_RT_GLOW_LOG", '1') && frame % 60 == 0) {
         Log("RT glow lamps frame %llu: %zu cached, %zu uncovered, %zu groups, %u added "
-            "(BB_RT_GLOW_PS), %u pale warm game lights take BB_RT_LAMP_HUE\n",
+            "(BB_RT_GLOW_PS), %u pale warm game lights take BB_RT_LAMP_HUE, scene cull %llu "
+            "frames (light camera %.1f m off)\n",
             (unsigned long long)frame, glow_lamps.size(), picks.size(), groups.size(),
-            glow_added_last, lamp_tinted_last);
+            glow_added_last, lamp_tinted_last, (unsigned long long)light_keep_scene_frames,
+            light_keep_cam_gap);
         for (size_t i = 0; i < picks.size() && i < 8; ++i) {
             const GlowLamp& g = glow_lamps[picks[i].k];
             Log("  glow world (%.2f %.2f %.2f) cam %.1f colour (%.2f %.2f %.2f) hits %u age %llu drift %.3f\n",
@@ -3624,12 +3864,10 @@ void RayTracing::AddSmoke(std::span<const Rt::FxParticle> particles, const Rt::D
     probe.entry = entry.id;
     probe.mode = 2;
     probes.push_back(probe);
-    if (pick_enabled) {
-        if (entry_tags.size() <= entry.id) {
-            entry_tags.resize(entry.id + 1);
-        }
-        entry_tags[entry.id] = instances.back().tag;
+    if (entry_tags.size() <= entry.id) {
+        entry_tags.resize(entry.id + 1);
     }
+    entry_tags[entry.id] = instances.back().tag;
     ++hitch.rebuilds;
     hitch.rebuilt_triangles += triangles;
     ++smoke_draws;
@@ -3663,6 +3901,9 @@ void RayTracing::AddSmoke(std::span<const Rt::FxParticle> particles, const Rt::D
 
 void RayTracing::AddDraw(const Rt::DrawInput& draw) {
     last_add_accepted = false;
+    if (u32(draw.tag.ps) == Rt::SkyLayerPs) {
+        sky_key.Add(frame, draw.index_count, draw.vertex_count);
+    }
     if (enabled && built_this_frame && draw.blended) {
         if (fx_held.size() >= fx_cap) {
             ++fx_blended_capped;
@@ -3681,6 +3922,8 @@ void RayTracing::AddDraw(const Rt::DrawInput& draw) {
     if (enabled && built_this_frame && late_mode && !(draw.depth_only && !depth_only_draws)) {
         if (late_held.size() < capacity.records) {
             late_held.push_back({draw, frame_inv_view, frame_camera_valid});
+            // The sky draws after the TLAS build: keep the layer's texture for the replay.
+            last_add_late = u32(draw.tag.ps) == Rt::SkyLayerPs;
         } else {
             ++late_dropped;
         }
@@ -3699,12 +3942,15 @@ void RayTracing::AddDraw(const Rt::DrawInput& draw) {
         fi.tag = draw.tag;
         fi.tag.draw = draw_index;
         fi.mode = mode;
-        if (pick_enabled) {
-            if (entry_tags.size() <= entry_id) {
-                entry_tags.resize(entry_id + 1);
-            }
-            entry_tags[entry_id] = fi.tag;
+        // Always kept, not only for BB_RT_PICK: a kept off-screen instance takes its tag from here
+        // and its TLAS mask from the tag. Without it the moon mesh (SkyLayerPs, 32 triangles about
+        // 750 m out, drawn only while in view) stayed in the TLAS as a solid card once the camera
+        // turned, right in front of the moon: every moon ray stopped on it and whole fields went
+        // black. Mist, water sheets, panes and portals lost their masks the same way.
+        if (entry_tags.size() <= entry_id) {
+            entry_tags.resize(entry_id + 1);
         }
+        entry_tags[entry_id] = fi.tag;
     };
     alpha_offered += draw.alpha_test ? 1u : 0u;
     if (draw.blended && fx_frame_blended >= fx_cap) {
@@ -3949,6 +4195,7 @@ bool RayTracing::Build(const SceneInputs& inputs) {
     }
     frame_camera_valid = inputs.camera_valid;
     frame_inv_view = inputs.inv_view;
+    frame_proj_scale = scale;
     const u32 slot = u32(frame % Slots);
     const u32 triangles = geometry.Triangles();
     if (auto* profiler = GpuProfiler::Get()) {
@@ -4150,9 +4397,14 @@ bool RayTracing::Build(const SceneInputs& inputs) {
                     .data_word_offset = u32(layout.data / 4),
                     .record_word_offset = u32(layout.records / 4),
                     .index_word_offset = u32(layout.indices / 4),
-                    .texture_slot = fi.texture,
+                    // The any-hit alpha test reads the alpha texture (else the albedo) in the
+                    // draw's alpha channel; the bake used the albedo's .a, so on draws with a
+                    // separate mask or channel the micromap marked micro-triangles solid or open
+                    // from the wrong data and shadows came out in blocks.
+                    .texture_slot = fi.alpha_texture ? fi.alpha_texture : fi.texture,
                     .level = omm_level,
                     .alpha_ref = fi.alpha_ref,
+                    .alpha_channel = u32(fi.alpha_channel) & 3u,
                 };
                 cmdbuf.pushConstants(*omm_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                                      sizeof(omm_push), &omm_push);
@@ -4326,6 +4578,7 @@ bool RayTracing::Build(const SceneInputs& inputs) {
     if (off_switches.instances) {
         AppendKeptInstances(current_inv_view);
     }
+    GlassMaskSlots(cmdbuf);
     auto* instance_data = reinterpret_cast<VkAccelerationStructureInstanceKHR*>(
         instances_ring.mapped + u64(slot) * instances_ring.slot_bytes);
     u64 unresolved_count = 0;
@@ -4337,6 +4590,11 @@ bool RayTracing::Build(const SceneInputs& inputs) {
         ReadPick();
         pick_snap[slot].clear();
         pick_snap_frame[slot] = frame;
+    }
+    if (kept_probe) {
+        ReadKeptProbe();
+        kept_snap[slot].assign(instances.size(), ~0u);
+        kept_snap_frame[slot] = frame;
     }
     const auto upload_start = std::chrono::steady_clock::now();
     FlipTlasMode();
@@ -4380,14 +4638,15 @@ bool RayTracing::Build(const SceneInputs& inputs) {
                                      WaterSheet(fi.tag.ps));
         if (Rt::HashListed(sky_ps, fi.tag.ps, 0) ||
             ((fi.tag.ps == Rt::FxMistShader || fi.tag.ps == Rt::WaterLayerShader) && !WaterSheet(fi.tag.ps))) {
-            data.mask = 0;
+            // The moon and cloud layer: only the sky layer pass traces it.
+            data.mask = u32(fi.tag.ps) == Rt::SkyLayerPs && !hidden ? Rt::MaskSky : 0u;
         }
         const bool alpha_instance = surface_enabled && fi.alpha_test && (fi.texture || fi.alpha_texture);
         const Rt::CacheEntry* omm_entry = alpha_instance ? entry : nullptr;
         const bool omm_instance = omm_entry && omm_entry->omm && omm_entry->omm_ready;
         // Glass panes go through the any-hit loops, which let rays pass them (rt_gi/rt_direct).
         const bool glass_instance =
-            glass_pass && GlassDraw(fi.tag.ps, entry ? entry->triangles : 0u);
+            glass_pass && (fi.glass_mask || GlassDraw(fi.tag.ps, entry ? entry->triangles : 0u));
         portal_instances += !hidden && PortalDraw(fi.tag.ps, entry ? entry->triangles : 0u) ? 1u : 0u;
         water_sheets += !hidden && data.mask == Rt::MaskWater ? 1u : 0u;
         water_puddles += !hidden && data.mask != 0 && data.mask != Rt::MaskWater && WaterDraw(fi.tag.ps) ? 1u : 0u;
@@ -4404,6 +4663,9 @@ bool RayTracing::Build(const SceneInputs& inputs) {
                       Rt::PtlasPartition(dynamic, fi.kept, fi.inv_view, center));
         } else {
             instance_data[i] = data;
+            if (kept_probe && fi.kept && !hidden && i < kept_snap[slot].size()) {
+                kept_snap[slot][i] = fi.entry_id;
+            }
         }
         NoteInstanceState(fi.entry_id, hidden ? 3u : std::min(fi.mode, 2u), fi.tag.ps,
                           Rt::InstanceState(fi.alpha_test, fi.texture || fi.alpha_texture, data.mask),
@@ -4798,13 +5060,14 @@ void RayTracing::LogGatedLights(const Rt::LightTargets& main) {
         }
         const Rt::LightDrawState& st = l.state;
         Log("RT light gate frame %llu: %s%s view (%.2f %.2f %.2f) radius %.2f colour (%.3f %.3f %.3f) "
-            "removed: %s; targets %u/%u (main %u/%u), mask %x/%x, blend %u src %u dst %u func %u / "
-            "%u src %u dst %u func %u, depth %u func %u bounds %u [%.6f %.6f] write %u cull %u quad z %.6f "
-            "(vtx %s)\n",
+            "removed: %s; targets %u/%u %upx (main %u/%u %upx), mask %x/%x, blend %u src %u dst %u "
+            "func %u / %u src %u dst %u func %u, depth %u func %u bounds %u [%.6f %.6f] write %u cull "
+            "%u quad z %.6f (vtx %s)\n",
             (unsigned long long)light_frame, l.shader_name ? l.shader_name : "?",
             l.camera_fixed ? " player fill light (camera-fixed)" : "", l.position[0],
             l.position[1], l.position[2], l.radius, l.color[0], l.color[1], l.color[2],
-            l.gate ? l.gate : "?", st.diffuse, st.specular, main.diffuse, main.specular, st.mask0,
+            l.gate ? l.gate : "?", st.diffuse, st.specular, st.width, main.diffuse, main.specular,
+            main.width, st.mask0,
             st.mask1, u32(st.blend0), st.src0, st.dst0, st.func0, u32(st.blend1), st.src1, st.dst1,
             st.func1, u32(st.depth), st.zfunc, u32(st.bounds), st.bounds_min, st.bounds_max,
             u32(st.depth_write), st.cull, Rt::LightDepthTest(st).quad, st.has_vtx ? "on" : "off");
@@ -5006,6 +5269,7 @@ void RayTracing::OnLightSetBuffer(VAddr address, u32 size) {
     cmdbuf.copyBuffer(source, direct_sets_ring.buffer, region);
     Barrier(cmdbuf, Stage::eTransfer, Access::eTransferWrite, Stage::eAllCommands,
             Access::eShaderRead | Access::eTransferRead);
+    RecordMoonDir(cmdbuf, u64(slot) * direct_sets_ring.slot_bytes, size);
     sets_snapshot_frame = frame;
     sets_snapshot_bytes = size;
     ++sets_snapshot_frames;
@@ -5041,6 +5305,94 @@ RayTracing::GpuSets RayTracing::ObtainGpuLightSets(u64 max_age) {
         return {};
     }
     return {buffer->Handle(), offset, direct_sets_source.bytes};
+}
+
+void RayTracing::RecordWorldSet(vk::CommandBuffer cmdbuf, vk::ImageView depth_view,
+                                vk::ImageView g3_view, const vk::DescriptorBufferInfo& sets,
+                                u32 set_count, u32 width, u32 height, vk::Buffer params,
+                                u64 params_offset) {
+    using Stage = vk::PipelineStageFlagBits2;
+    using Access = vk::AccessFlagBits2;
+    using Type = vk::DescriptorType;
+    // Same switch as the direct pass (BB_RT_MOON_WORLD=0 keeps each pixel's own set there too);
+    // BB_RT_GI_WORLD_SET=0 (live) turns off only this vote, for A/B against the direct pass.
+    if (!world_set_pipeline || !moon_world || !gi_world_set || set_count == 0) {
+        return;
+    }
+    const vk::DescriptorImageInfo depth_info{.imageView = depth_view,
+                                             .imageLayout = vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo g3_info{.imageView = g3_view,
+                                          .imageLayout = vk::ImageLayout::eGeneral};
+    const vk::DescriptorBufferInfo out_info{params, params_offset, ParamsSlotBytes};
+    const auto write = [](u32 binding, Type type, const vk::DescriptorImageInfo* image,
+                          const vk::DescriptorBufferInfo* buffer) {
+        return vk::WriteDescriptorSet{.dstBinding = binding,
+                                      .descriptorCount = 1,
+                                      .descriptorType = type,
+                                      .pImageInfo = image,
+                                      .pBufferInfo = buffer};
+    };
+    const std::array<vk::WriteDescriptorSet, 4> writes = {{
+        write(0, Type::eSampledImage, &depth_info, nullptr),
+        write(1, Type::eSampledImage, &g3_info, nullptr),
+        write(2, Type::eStorageBuffer, nullptr, &sets),
+        write(3, Type::eStorageBuffer, nullptr, &out_info),
+    }};
+    const WorldSetPush push{float(width), float(height), set_count, WorldSetWord};
+    Barrier(cmdbuf, Stage::eHost | Stage::eAllCommands, Access::eHostWrite | Access::eShaderRead,
+            Stage::eComputeShader, Access::eShaderWrite | Access::eShaderRead);
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *world_set_pipeline);
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *world_set_pipeline_layout, 0,
+                                writes);
+    cmdbuf.pushConstants(*world_set_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                         sizeof(push), &push);
+    cmdbuf.dispatch(1, 1, 1);
+    Barrier(cmdbuf, Stage::eComputeShader, Access::eShaderWrite, Stage::eAllCommands,
+            Access::eUniformRead | Access::eShaderRead);
+    if (world_set_frames++ == 0) {
+        Log("Ray tracing: world set vote on (BB_RT_MOON_WORLD): GI and reflection hits take the "
+            "moon from the directional set the direct pass votes for, not the pixel's own set\n");
+    }
+}
+
+// Light 1 of every set in this frame's set copy points at the moon the sky draws (rt_sky.comp
+// phase 3 finds it, rt_moon_dir.comp writes it). Runs on the copy only; BB_RT_MOON_FROM_SKY=0
+// (live) keeps the game's direction.
+void RayTracing::RecordMoonDir(vk::CommandBuffer cmdbuf, u64 sets_offset, u32 sets_bytes) {
+    using Stage = vk::PipelineStageFlagBits2;
+    using Access = vk::AccessFlagBits2;
+    using Type = vk::DescriptorType;
+    const u32 set_count = sets_bytes / Rt::DirLightSetStride;
+    if (!moon_dir_pipeline || !moon_from_sky || !material.buffer || set_count == 0) {
+        return;
+    }
+    const vk::DescriptorBufferInfo sets_info{direct_sets_ring.buffer, sets_offset,
+                                             u64(set_count) * Rt::DirLightSetStride};
+    const vk::DescriptorBufferInfo material_info{material.buffer, 0, material.size};
+    const std::array<vk::WriteDescriptorSet, 2> writes = {{
+        {.dstBinding = 0, .descriptorCount = 1, .descriptorType = Type::eStorageBuffer,
+         .pBufferInfo = &sets_info},
+        {.dstBinding = 1, .descriptorCount = 1, .descriptorType = Type::eStorageBuffer,
+         .pBufferInfo = &material_info},
+    }};
+    const float min_sin = std::sin(moon_min_elevation * 0.017453293f);
+    u32 min_sin_bits;
+    std::memcpy(&min_sin_bits, &min_sin, sizeof(min_sin_bits));
+    const MoonDirPush push{set_count, Rt::MoonDirSlot(capacity.records), min_sin_bits, 0u};
+    Barrier(cmdbuf, Stage::eAllCommands, Access::eMemoryWrite, Stage::eComputeShader,
+            Access::eShaderRead | Access::eShaderWrite);
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *moon_dir_pipeline);
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *moon_dir_pipeline_layout, 0,
+                                writes);
+    cmdbuf.pushConstants(*moon_dir_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                         sizeof(push), &push);
+    cmdbuf.dispatch((set_count + 63) / 64, 1, 1);
+    Barrier(cmdbuf, Stage::eComputeShader, Access::eShaderWrite, Stage::eAllCommands,
+            Access::eShaderRead | Access::eTransferRead);
+    if (moon_dir_frames++ == 0) {
+        Log("Ray tracing: moon direction from the sky on (BB_RT_MOON_FROM_SKY): light 1 of the "
+            "set copy points at the moon the sky draws once it has been on screen\n");
+    }
 }
 
 void RayTracing::ApplySetReadback() {
@@ -5227,6 +5579,14 @@ void RayTracing::LogDirSets() {
     }
 }
 
+void RayTracing::SetLightKeepCamera(const SceneInputs& inputs) noexcept {
+    light_keep_proj = {inputs.projection[0], inputs.projection[1]};
+    light_keep_cam = inputs.camera_valid;
+    if (light_keep_cam) {
+        light_keep_inv_view = inputs.inv_view;
+    }
+}
+
 void RayTracing::EndLightFrame() {
     if (light_draws.empty() && pending_lights.empty()) {
         return;
@@ -5290,6 +5650,18 @@ void RayTracing::EndLightFrame() {
             keep_view.valid = true;
             break;
         }
+        if (light_keep_scene && light_keep_cam) {
+            keep_view.cull_view = Rt::InverseRigid(light_keep_inv_view);
+            keep_view.cull_valid = true;
+            ++light_keep_scene_frames;
+            if (keep_view.valid) {
+                // How far the light-draw camera sits from the scene camera (logged).
+                const Rt::Affine a = Rt::InverseRigid(keep_view.view);
+                const float dx = a[3] - light_keep_inv_view[3], dy = a[7] - light_keep_inv_view[7],
+                            dz = a[11] - light_keep_inv_view[11];
+                light_keep_cam_gap = std::sqrt(dx * dx + dy * dy + dz * dz);
+            }
+        }
         direct_duplicates +=
             Rt::MergeDirectLights(pending_lights, light_frame, direct_keep, direct_tracks, direct_lights,
                                   &direct_keys, off_switches.lights ? &keep_view : nullptr);
@@ -5317,6 +5689,14 @@ void RayTracing::EndLightFrame() {
             }
             const bool lamp = !mobile && housed && l.radius >= lamp_rmin && l.radius <= lamp_rmax;
             l.lamp = lamp;
+            const bool candle = !lamp && !mobile && l.radius <= candle_rmax;
+            // How much brighter than a lantern (BB_RT_EMITTER_BRIGHT) the game makes this fire, from
+            // its colour before our flicker: the reach and, for a fixed fire, the sway grow with it.
+            float grow = 1.0f;
+            if (!lamp && !candle && emitter_bright > 0.0f) {
+                const float peak_c = std::max({l.color[0], l.color[1], l.color[2]});
+                grow = std::sqrt(std::max(peak_c / emitter_bright, 1.0f));
+            }
             if (tracked) {
                 const u64 id = direct_tracks.list[i].id;
                 const auto m = flicker_mean.find(id);
@@ -5325,18 +5705,34 @@ void RayTracing::EndLightFrame() {
                                                  emitter_flicker, emitter_flicker_avg,
                                                  emitter_flicker_smooth);
                 flicker_mean_next[id] = st;
-                // The game keeps most fixed flames steady: they get a flicker of their own.
-                if (st.dev < 0.01f && emitter_steady_flicker > 0.0f) {
-                    k *= std::exp(emitter_steady_flicker * Rt::FlameNoise(id, flicker_seconds));
+                // The game keeps most fixed flames steady or only swells them slowly (the workshop
+                // fireplace: +9% for 20 frames every ~1.7 s, mean |dev| 1.5%): they get a flicker
+                // of their own on top. A flame the game itself flickers (dev ~6%+) keeps its own.
+                if (st.dev < emitter_steady_dev && emitter_steady_flicker > 0.0f) {
+                    float noise = Rt::FlameNoise(id, flicker_seconds);
+                    if (grow > 1.0f) {
+                        noise += emitter_big_fast * Rt::FlameNoise(id ^ 0x9E3779B97F4A7C15ull,
+                                                                   flicker_seconds * 3.0);
+                    }
+                    k *= std::exp(emitter_steady_flicker * std::pow(grow, emitter_big_flicker) * noise);
+                }
+                if (grow > 1.0f) {
+                    k *= emitter_big_gain;
                 }
                 for (float& c : l.color) c *= k;
                 for (float& c : l.spec) c *= k;
-                // Carried flames (hand torch, enemy torches) and candles (fixed, game r up to
-                // BB_RT_CANDLE_RMAX) sway, scaled by the game radius. Other fixed lights only
-                // flicker: wall lamps in open cages measure 1-10% enclosed, like a fire, so the
-                // enclosure test alone would let them sway; they are r 5 m and up, candles 2 m.
-                if (!lamp && (mobile || l.radius <= candle_rmax)) {
-                    const float amp = emitter_sway * std::clamp(l.radius / 8.5f, 0.2f, 1.0f);
+                // Carried flames (hand torch, enemy torches) sway, scaled by the game radius. Fixed
+                // flames (candles, candelabra, fireplace) sway by BB_RT_FIXED_SWAY: an indoor
+                // flame's light centre moves about 1 cm; 5 cm doubled the measured shadow motion
+                // (optical flow 0.023 -> 0.044 px/f) and read as too much wobble, 1.5 cm stays near
+                // stock (0.015-0.022). The game radius says nothing of the flame size; its brightness
+                // does: a fire brighter than a lantern (the burning house, 6.4-12.8 vs 2.0) is metres
+                // of flame, and its light centre wanders BB_RT_EMITTER_SWAY x (grow - 1) more
+                // (house: ~0.25 m), so the shadows it casts dance.
+                if (!lamp) {
+                    const float amp = mobile
+                                          ? emitter_sway * std::clamp(l.radius / 8.5f, 0.2f, 1.0f)
+                                          : fixed_sway + emitter_sway * (grow - 1.0f);
                     const auto o = Rt::FlameSway(id, flicker_seconds, amp);
                     for (int a = 0; a < 3; ++a) l.world[a] += o[a];
                 }
@@ -5345,8 +5741,9 @@ void RayTracing::EndLightFrame() {
                 l.world[1] += fire_lift;
                 ++fire_lift_last;
             }
-            const bool candle = !lamp && !mobile && l.radius <= candle_rmax;
-            if (Rt::EmitterFalloff(l, lamp ? lamp_range : candle ? candle_range : emitter_range,
+            const float range = (lamp ? lamp_range : candle ? candle_range : emitter_range) * grow;
+            l.wide = grow > 1.0f;
+            if (Rt::EmitterFalloff(l, range,
                                    lamp ? lamp_source : candle ? candle_source : emitter_source,
                                    emitter_lift, emitter_peak, emitter_flame)) {
                 ++emitter_falloff_last;
@@ -5356,10 +5753,15 @@ void RayTracing::EndLightFrame() {
         flicker_mean.swap(flicker_mean_next);
         flicker_mean_next.clear();
         TintLampLights();
-        AddGlowLights(keep_view.valid ? &keep_view.view : nullptr);
+        AddGlowLights(keep_view.cull_valid ? &keep_view.cull_view
+                      : keep_view.valid    ? &keep_view.view
+                                           : nullptr);
         // BB_RT_DIRECT_LIST_LOG=1 (live): every 30 frames, the state of each direct light (game
         // radius, reach used, emitter, fill-vis state, track age and mobility).
-        if (Rt::KnobIs("BB_RT_DIRECT_LIST_LOG", '1') && light_frame >= direct_list_log + 30) {
+        // =2: every frame (flicker timing).
+        const bool list_every = Rt::KnobIs("BB_RT_DIRECT_LIST_LOG", '2');
+        if ((list_every || Rt::KnobIs("BB_RT_DIRECT_LIST_LOG", '1')) &&
+            light_frame >= direct_list_log + (list_every ? 1 : 30)) {
             direct_list_log = light_frame;
             const size_t n = std::min(direct_lights.size(), direct_tracks.list.size());
             const auto cam = [&](size_t k) {
@@ -5371,6 +5773,22 @@ void RayTracing::EndLightFrame() {
                 order[k] = k;
             }
             std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return cam(a) < cam(b); });
+            // The game's own draws of this frame within 6 m of the camera (its colour and timing
+            // per light, before tracking, flicker and sway).
+            for (size_t k = 0; k < pending_lights.size() && k < 256; ++k) {
+                const Rt::Light& r = pending_lights[k];
+                const float d = std::sqrt(r.position[0] * r.position[0] + r.position[1] * r.position[1] +
+                                          r.position[2] * r.position[2]);
+                if (d <= 6.0f && Rt::DirectCandidate(r)) {
+                    Log("RT dlist raw frame %llu #%zu %s draw %u legacy %d shadowed %d world (%.2f %.2f "
+                        "%.2f) r %.2f colour (%.3f %.3f %.3f) spec (%.3f %.3f %.3f) stencil %08x key "
+                        "%016llx cam %.1f\n",
+                        (unsigned long long)light_frame, k, r.shader_name ? r.shader_name : "?", r.draw,
+                        r.legacy ? 1 : 0, r.shadowed ? 1 : 0, r.world[0], r.world[1], r.world[2],
+                        r.radius, r.color[0], r.color[1], r.color[2], r.spec[0], r.spec[1], r.spec[2],
+                        r.stencil, (unsigned long long)Rt::DirectKey(r), d);
+                }
+            }
             for (size_t j = 0; j < n && j < 64; ++j) {
                 const size_t i = order[j];
                 const Rt::DirectTrack& t = direct_tracks.list[i];
@@ -5379,7 +5797,8 @@ void RayTracing::EndLightFrame() {
                 const bool has = f != fill_vis.end();
                 Log("RT dlist frame %llu #%zu id %llu %s world (%.2f %.2f %.2f) game r %.2f reach r %.2f "
                     "lum %.3f emitter %d lamp %d age %u frames %u mobile %d fill %s applied %.2f "
-                    "enclosed %.1f%% up %.1f%% near %.2f m visible %d game colour (%.3f %.3f %.3f) cam %.1f\n",
+                    "enclosed %.1f%% up %.1f%% near %.2f m visible %d game colour (%.3f %.3f %.3f) "
+                    "track colour (%.3f %.3f %.3f) cam %.1f\n",
                     (unsigned long long)light_frame, i, (unsigned long long)t.id,
                     t.light.shader_name ? t.light.shader_name : "?", t.light.world[0],
                     t.light.world[1], t.light.world[2], t.light.radius, l.radius,
@@ -5392,7 +5811,7 @@ void RayTracing::EndLightFrame() {
                     has ? f->second.last.near_solid : -1.0f,
                     has && f->second.last.visible ? 1 : 0, has ? f->second.game_color[0] : -1.0f,
                     has ? f->second.game_color[1] : -1.0f, has ? f->second.game_color[2] : -1.0f,
-                    cam(i));
+                    t.light.color[0], t.light.color[1], t.light.color[2], cam(i));
             }
         }
         direct_set_count = 0;
@@ -5465,7 +5884,7 @@ void RayTracing::ApplyFillVis() {
         const u64 key = Rt::FillVisKey(l);
         const auto [it, inserted] = fill_vis.try_emplace(key);
         FillVisEntry& e = it->second;
-        if (fill_vis_flicker > 0.0f && !e.emitter) {
+        if (fill_vis_flicker > 0.0f && !e.pulse) {
             constexpr u32 FillFlickerTurns = 6;
             const float lum = l.color[0] + l.color[1] + l.color[2];
             if (l.radius != e.flicker_radius) {
@@ -5485,6 +5904,7 @@ void RayTracing::ApplyFillVis() {
             e.flicker_last = lum;
             if (e.flicker_turns >= FillFlickerTurns) {
                 e.emitter = true;
+                e.pulse = true;
                 if (direct_light_log > 0.0f) {
                     Log("RT fill vis frame %llu: %s world (%.2f %.2f %.2f) radius %.2f flickers "
                         "(%u turns over BB_RT_FILL_FLICKER %.3f): emitter\n",
@@ -5494,7 +5914,7 @@ void RayTracing::ApplyFillVis() {
                 }
             }
         }
-        if (fill_vis_warm && !e.emitter && Rt::WarmEmitter(l)) {
+        if (fill_vis_warm && !e.emitter && Rt::WarmEmitter(l, fill_vis_warm_hue)) {
             e.emitter = true;
         }
         if (inserted) {
@@ -5588,6 +6008,12 @@ void RayTracing::ApplyFillVis() {
         carried = carried && flame;
         l.held = held;
         l.emitter = flame && (e.emitter || cluster || carried || held);
+        // A pale light whose colour pulses is an animated source (the messengers' bath in the
+        // Hunter's Dream breathes on a ~1 s cycle): designer fills hold still. It keeps the game's
+        // light as is, like the loot light below; only flames take the emitter falloff.
+        if (!flame && e.pulse) {
+            continue;
+        }
         // The loot's own light (pale, next to its wisp) is real: it keeps the game's light as is,
         // instead of fading out like a designer fill light.
         if (!l.emitter && !flame) {
@@ -5737,6 +6163,337 @@ void RayTracing::ReadFillVis() {
                 r.near_solid, r.near_blended, r.visible ? "on" : "hidden", r.depth_gap,
                 r.screen_luma, scale, fill_vis_sky_full, fill_vis_floor, fill_vis_enclosed);
         }
+    }
+}
+
+// The game's moon and cloud layer (rt_gi.comp RT_SKY_LAYER): trace the grid, then find the moon.
+void RayTracing::RecordSkyLayer(vk::CommandBuffer cmdbuf,
+                                std::span<const vk::WriteDescriptorSet> gi_writes) {
+    using Stage = vk::PipelineStageFlagBits2;
+    using Access = vk::AccessFlagBits2;
+    if (!moon_from_sky || !sky_layer_pipeline || !moon_dir_pipeline || !material.buffer ||
+        frame % Rt::SkyLayerEvery != 0) {
+        return;
+    }
+    ReadMoonRing();
+    const u64 key = sky_key.Recent(frame, Rt::SkyLayerEvery * 2) ? sky_key.Key() : 0;
+    const std::array<float, 3> cam{frame_inv_view[3], frame_inv_view[7], frame_inv_view[11]};
+    std::array<float, 3> seed_dir{};
+    // The cached moon of this sky's draws, also while the camera looks away from the sky (the
+    // game culls every cloud segment when the view points at the ground): without the seed the
+    // moon ran out after MoonHold searches and light 1 fell back to the game's own direction,
+    // 10-40 degrees off, so shadows swung. Held MoonSeedHold frames past the last layer draw so
+    // an interior reached by a load does not keep the last map's moon.
+    constexpr u64 MoonSeedHold = 1800;
+    const bool seed = sky_key.Recent(frame, MoonSeedHold) && frame_camera_valid &&
+                      moon_cache.DirFromDraws(sky_key.Draws(), cam, seed_dir);
+    const bool reset = sky_key.Generation() != moon_generation;
+    moon_generation = sky_key.Generation();
+    if (reset) {
+        moon_found_run = false;
+        moon_last_found = false;
+    }
+    SkyLayerPush push{
+        .layer_base = Rt::SkyLayerSlot(capacity.records, 0),
+        .moon_slot = Rt::MoonDirSlot(capacity.records),
+        .phase = 0u,
+        .moon_min = moon_min,
+        .moon_seed = seed ? std::array<float, 4>{seed_dir[0], seed_dir[1], seed_dir[2], 1.0f}
+                          : std::array<float, 4>{},
+        .moon_reset = (reset ? 1u : 0u) | (moon_layer_find ? 2u : 0u),
+    };
+    const vk::DescriptorSet surface_set =
+        surface_last.set && surface_last.slot == built_slot &&
+                surface_last.tick == scheduler.CurrentTick()
+            ? surface_last.set
+            : SurfaceSet(cmdbuf, built_slot);
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *sky_layer_pipeline);
+    cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *sky_layer_pipeline_layout, 1,
+                              surface_set, {});
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *sky_layer_pipeline_layout, 0,
+                                gi_writes);
+    cmdbuf.pushConstants(*sky_layer_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                         sizeof(push), &push);
+    cmdbuf.dispatch((Rt::SkyLayerWidth + 7) / 8, (Rt::SkyLayerHeight + 7) / 8, 1);
+    Barrier(cmdbuf, Stage::eComputeShader, Access::eShaderWrite, Stage::eComputeShader,
+            Access::eShaderRead | Access::eShaderWrite);
+    push.phase = 1u;
+    cmdbuf.pushConstants(*sky_layer_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                         sizeof(push), &push);
+    cmdbuf.dispatch(1, 1, 1);
+    const u32 ring = u32(sky_layer_frames % Slots);
+    if (moon_ring.mapped && moon_ring_frame[ring] == ~0ull) {
+        // The moon slot and the search stats back to the CPU for the moon cache.
+        Barrier(cmdbuf, Stage::eComputeShader, Access::eShaderWrite, Stage::eTransfer,
+                Access::eTransferRead);
+        const u64 dst = u64(ring) * moon_ring.slot_bytes;
+        const std::array<vk::BufferCopy, 2> regions{{
+            {u64(push.moon_slot) * 16, dst, 16},
+            {u64(Rt::SkyLayerSlot(capacity.records, Rt::SkyLayerCells)) * 16, dst + 16, 64},
+        }};
+        cmdbuf.copyBuffer(material.buffer, moon_ring.buffer, regions);
+        Barrier(cmdbuf, Stage::eTransfer, Access::eTransferWrite, Stage::eHost, Access::eHostRead);
+        moon_ring_tick[ring] = scheduler.CurrentTick();
+        moon_ring_frame[ring] = frame;
+        // The cache is per layer draw (SkyKey::Draws), so a find counts while the layer draws,
+        // also when no draw was in every frame of the run (Key() 0, kept here as 1): Cathedral
+        // Ward under the blood moon dropped its finds ("sky 0000000000000000 found 30.63 degrees
+        // from its cached position") until one cloud segment had stayed in view.
+        const bool layer_draws =
+            sky_key.Recent(frame, Rt::SkyLayerEvery * 2) && !sky_key.Draws().empty();
+        moon_ring_key[ring] = key ? key : (layer_draws ? 1 : 0);
+        moon_ring_gen[ring] = sky_key.Generation();
+        moon_ring_view[ring] = frame_inv_view;
+    }
+    SkyImageIo(cmdbuf, key);
+    if (sky_layer_frames++ == 0) {
+        Log("Ray tracing: moon and cloud layer on (%ux%u grid, moon score > %.2f), moon cache %s "
+            "(%zu skies)\n",
+            Rt::SkyLayerWidth, Rt::SkyLayerHeight, moon_min, moon_cache_path.c_str(),
+            moon_cache.Size());
+    }
+}
+
+void RayTracing::SkyImageIo(vk::CommandBuffer cmdbuf, u64 key) {
+    using Stage = vk::PipelineStageFlagBits2;
+    using Access = vk::AccessFlagBits2;
+    constexpr u64 cells = Rt::SkyImageCells;
+    constexpr u64 bytes = cells * 16;
+    const u64 offset = u64(Rt::SkyImageSlot(capacity.records, 0)) * 16;
+    if (sky_io_failed || offset + bytes > material.size) {
+        return;
+    }
+    const auto allocator = instance.GetAllocator();
+    if (!sky_io_buffer) {
+        const char* dir = Rt::Knob("BB_RT_SKY_CACHE");
+        sky_cache_dir = dir && dir[0] ? dir : "rt_sky";
+        // Cached host memory: the CPU reads the whole image back.
+        const VkBufferCreateInfo buffer_ci{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = bytes,
+            .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        };
+        const VmaAllocationCreateInfo alloc_ci{
+            .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
+                     VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+            .usage = VMA_MEMORY_USAGE_AUTO,
+        };
+        VkBuffer raw{};
+        VmaAllocationInfo info{};
+        if (vmaCreateBuffer(allocator, &buffer_ci, &alloc_ci, &raw, &sky_io_allocation, &info) !=
+                VK_SUCCESS ||
+            !info.pMappedData) {
+            if (raw) {
+                vmaDestroyBuffer(allocator, raw, sky_io_allocation);
+            }
+            sky_io_failed = true;
+            Log("Ray tracing: sky image cache off (no %llu MiB host buffer)\n",
+                (unsigned long long)(bytes >> 20));
+            return;
+        }
+        sky_io_buffer = raw;
+        sky_io_mapped = static_cast<float*>(info.pMappedData);
+    }
+    const auto path_of = [&](u64 k) {
+        char name[32];
+        std::snprintf(name, sizeof(name), "/%016llx.bin", (unsigned long long)k);
+        return sky_cache_dir + name;
+    };
+    if (sky_io != SkyIo::Idle) {
+        if (!scheduler.IsFree(sky_io_tick)) {
+            return;
+        }
+        if (sky_io == SkyIo::Readback && key && key == sky_io_key &&
+            sky_key.Generation() == sky_io_generation) {
+            vmaInvalidateAllocation(allocator, sky_io_allocation, 0, VK_WHOLE_SIZE);
+            size_t seen = 0;
+            for (u64 i = 0; i < cells; ++i) {
+                seen += sky_io_mapped[i * 4 + 3] > 0.0f ? 1 : 0;
+            }
+            size_t& saved = sky_saved_seen[key];
+            // Saved again once it grew by 0.5 % (a look at new sky, not capture noise).
+            if (seen > saved + saved / 200 + 64) {
+                const auto start = std::chrono::steady_clock::now();
+                std::error_code ec;
+                std::filesystem::create_directories(sky_cache_dir, ec);
+                const std::string path = path_of(key);
+                const bool ok = Rt::SaveSkyFile(
+                    path.c_str(), Rt::EncodeSkyWords(Rt::PackSkyCells(sky_io_mapped, cells, nullptr)));
+                const double ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - start)
+                                      .count();
+                Log("Ray tracing: sky image of sky %016llx saved to %s, %zu cells (%.1f %%), "
+                    "%.1f ms%s\n",
+                    (unsigned long long)key, path.c_str(), seen, 100.0 * double(seen) / double(cells),
+                    ms, ok ? "" : " FAILED");
+                if (ok) {
+                    saved = seen;
+                }
+            }
+        }
+        sky_io = SkyIo::Idle;
+    }
+    if (!key) {
+        return;
+    }
+    const u64 generation = sky_key.Generation();
+    if (generation != sky_seed_generation || key != sky_seed_key) {
+        // A new sky (or the key narrowed): its cached image, else nothing from the last sky.
+        const bool new_run = generation != sky_seed_generation;
+        sky_seed_generation = generation;
+        sky_seed_key = key;
+        sky_io_next = frame + SkyIoEvery;
+        const std::string path = path_of(key);
+        std::vector<u32> encoded, words;
+        if (Rt::LoadSkyFile(path.c_str(), encoded) && Rt::DecodeSkyWords(encoded, cells, words)) {
+            const size_t n = Rt::UnpackSkyCells(words, sky_io_mapped);
+            vmaFlushAllocation(allocator, sky_io_allocation, 0, VK_WHOLE_SIZE);
+            Barrier(cmdbuf, Stage::eComputeShader, Access::eShaderRead | Access::eShaderWrite,
+                    Stage::eTransfer, Access::eTransferWrite);
+            cmdbuf.copyBuffer(sky_io_buffer, material.buffer, vk::BufferCopy{0, offset, bytes});
+            Barrier(cmdbuf, Stage::eTransfer, Access::eTransferWrite, Stage::eComputeShader,
+                    Access::eShaderRead | Access::eShaderWrite);
+            sky_io = SkyIo::Upload;
+            sky_io_tick = scheduler.CurrentTick();
+            sky_saved_seen[key] = std::max(sky_saved_seen[key], n);
+            Log("Ray tracing: sky image of sky %016llx loaded from %s, %zu cells (%.1f %%)\n",
+                (unsigned long long)key, path.c_str(), n, 100.0 * double(n) / double(cells));
+        } else if (new_run) {
+            Barrier(cmdbuf, Stage::eComputeShader, Access::eShaderRead | Access::eShaderWrite,
+                    Stage::eTransfer, Access::eTransferWrite);
+            cmdbuf.fillBuffer(material.buffer, offset, bytes, 0u);
+            Barrier(cmdbuf, Stage::eTransfer, Access::eTransferWrite, Stage::eComputeShader,
+                    Access::eShaderRead | Access::eShaderWrite);
+            Log("Ray tracing: sky image of sky %016llx not cached yet (%s)\n",
+                (unsigned long long)key, path.c_str());
+        }
+        return;
+    }
+    if (frame < sky_io_next) {
+        return;
+    }
+    sky_io_next = frame + SkyIoEvery;
+    Barrier(cmdbuf, Stage::eComputeShader, Access::eShaderWrite, Stage::eTransfer,
+            Access::eTransferRead);
+    cmdbuf.copyBuffer(material.buffer, sky_io_buffer, vk::BufferCopy{offset, 0, bytes});
+    Barrier(cmdbuf, Stage::eTransfer, Access::eTransferWrite, Stage::eHost, Access::eHostRead);
+    sky_io = SkyIo::Readback;
+    sky_io_tick = scheduler.CurrentTick();
+    sky_io_key = key;
+    sky_io_generation = generation;
+}
+
+void RayTracing::ReadMoonRing() {
+    if (moon_cache_path.empty()) {
+        const char* path = Rt::Knob("BB_RT_MOON_CACHE");
+        moon_cache_path = path && path[0] ? path : "rt_moon.txt";
+        moon_cache.Load(moon_cache_path.c_str());
+    }
+    for (u32 i = 0; i < Slots; ++i) {
+        if (moon_ring_frame[i] == ~0ull || !scheduler.IsFree(moon_ring_tick[i])) {
+            continue;
+        }
+        const auto* v = reinterpret_cast<const float*>(moon_ring.mapped + u64(i) * moon_ring.slot_bytes);
+        const u64 key = moon_ring_key[i];
+        const u64 ring_frame = moon_ring_frame[i];
+        moon_ring_frame[i] = ~0ull;
+        {
+            // Where light 1 points from (rt_moon_dir.comp): the sky moon, or the game's own
+            // per-map directions once the slot runs out.
+            const int source =
+                !(v[3] > 0.0f) ? 0 : (v[3] >= Rt::MoonHoldSearches - 1.0f ? 1 : 2);
+            // While no sky moon is known, the search stats every ~5 s: peak score, ring mean
+            // (found needs peak > BB_RT_MOON_MIN and > 4 x ring) and the peak's grid cell.
+            // Also while a cached moon lights the scene but this run has not confirmed a disc.
+            if ((source == 0 || !moon_found_run) && ring_frame >= moon_stats_logged + 300) {
+                moon_stats_logged = ring_frame;
+                Log("Ray tracing: moon search at frame %llu: peak %.3f, ring %.3f, cell %.0f %.0f, "
+                    "w %.0f, light %.3f %.3f %.3f\n",
+                    (unsigned long long)ring_frame, v[4], v[5], v[6], v[7], v[3], v[0], v[1], v[2]);
+            }
+            // BB_RT_MOON_SCREEN_LOG=1: where the light-1 direction lands on screen (uv 0..1, y
+            // down) every ~5 s, to check it against the moon the game draws.
+            if (Rt::KnobIs("BB_RT_MOON_SCREEN_LOG", '1') && source != 0 &&
+                ring_frame >= moon_screen_logged + 300) {
+                moon_screen_logged = ring_frame;
+                const Rt::Affine& iv = moon_ring_view[i];
+                const float vx = iv[0] * v[0] + iv[4] * v[1] + iv[8] * v[2];
+                const float vy = iv[1] * v[0] + iv[5] * v[1] + iv[9] * v[2];
+                const float vz = iv[2] * v[0] + iv[6] * v[1] + iv[10] * v[2];
+                const float u = vz > 1e-4f ? 0.5f + 0.5f * vx * frame_proj_scale[0] / vz : -1.0f;
+                const float w = vz > 1e-4f ? 0.5f - 0.5f * vy * frame_proj_scale[1] / vz : -1.0f;
+                Log("Ray tracing: moon light on screen at frame %llu: uv %.3f %.3f (view %.3f %.3f "
+                    "%.3f, world %.3f %.3f %.3f, proj %.3f %.3f, sky %016llx, camera %.1f %.1f "
+                    "%.1f, right %.3f %.3f %.3f, up %.3f %.3f %.3f, forward %.3f %.3f %.3f; "
+                    "search peak %.3f ring %.3f cell %.0f %.0f w %.0f "
+                    "found %.3f %.3f %.3f; screen moon %.3f %.3f %.3f, peak %.3f mean %.3f spread "
+                    "%.1f bright samples %.0f)\n",
+                    (unsigned long long)ring_frame, u, w, vx, vy, vz, v[0], v[1], v[2],
+                    frame_proj_scale[0], frame_proj_scale[1], (unsigned long long)key, iv[3],
+                    iv[7], iv[11], iv[0], iv[4], iv[8], iv[1], iv[5], iv[9], iv[2], iv[6], iv[10],
+                    v[4], v[5], v[6], v[7], v[3], v[9],
+                    v[10], v[11], v[12], v[13], v[14], v[16], v[17], v[18], v[19]);
+            }
+            if (source != moon_source_logged) {
+                static constexpr const char* names[] = {"the game's sets (no sky moon)",
+                                                        "the sky moon", "the sky moon, fading out"};
+                Log("Ray tracing: moon light from %s at frame %llu (sky %016llx, w %.0f, "
+                    "direction %.3f %.3f %.3f)\n",
+                    names[source], (unsigned long long)ring_frame, (unsigned long long)key, v[3],
+                    v[0], v[1], v[2]);
+                moon_source_logged = source;
+            }
+        }
+        // w == MoonHold (rt_gi.comp) only on the search that found the disc; a kept moon after a
+        // find this run is the same disc, so it also fills a key that narrowed since.
+        const bool found = v[3] == Rt::MoonHoldSearches;
+        // v[8]: the disc's distance along the found direction (rt_gi.comp LayerHitT); v[9..11]
+        // the found direction itself (v[0..2] is the light, which follows the cached moon).
+        if (found && v[8] > 0.0f) {
+            // Two finds in a row within MoonCache::Same confirm the disc; its world position is
+            // the camera of that search plus the distance along the direction.
+            const bool found_dir = v[9] != 0.0f || v[10] != 0.0f || v[11] != 0.0f;
+            const std::array<float, 3> dir = found_dir ? std::array<float, 3>{v[9], v[10], v[11]}
+                                                       : std::array<float, 3>{v[0], v[1], v[2]};
+            bool confirmed = false;
+            if (moon_last_found &&
+                dir[0] * moon_last[0] + dir[1] * moon_last[1] + dir[2] * moon_last[2] >
+                    std::cos(Rt::MoonCache::Same)) {
+                const Rt::Affine& iv = moon_ring_view[i];
+                moon_confirmed = {iv[3] + dir[0] * v[8], iv[7] + dir[1] * v[8],
+                                  iv[11] + dir[2] * v[8]};
+                // First confirmed find of this run: how far the cached moon (the seed) was off.
+                std::array<float, 3> cached{};
+                if (!moon_found_run &&
+                    moon_cache.DirFromDraws(sky_key.Draws(), {iv[3], iv[7], iv[11]}, cached)) {
+                    const float d = cached[0] * dir[0] + cached[1] * dir[1] + cached[2] * dir[2];
+                    Log("Ray tracing: moon of sky %016llx found %.2f degrees from its cached "
+                        "position (camera %.1f %.1f %.1f)\n",
+                        (unsigned long long)key,
+                        std::acos(std::clamp(d, -1.0f, 1.0f)) * 57.29578f, iv[3], iv[7], iv[11]);
+                }
+                moon_found_run = true;
+                confirmed = true;
+            }
+            moon_last = dir;
+            moon_last_found = true;
+            // Each confirmed find once into the cache's running mean (rt_moon_cache.h).
+            if (!confirmed || key == 0 || moon_ring_gen[i] != sky_key.Generation() ||
+                !moon_cache.PutDraws(sky_key.Draws(), moon_confirmed)) {
+                continue;
+            }
+        } else {
+            continue;
+        }
+        const bool saved = moon_cache.Save(moon_cache_path.c_str());
+        std::array<float, 3> mean = moon_confirmed;
+        moon_cache.FindDraws(sky_key.Draws(), mean);
+        const Rt::Affine& iv = moon_ring_view[i];
+        Log("Ray tracing: moon of sky %016llx cached at (%.1f %.1f %.1f), mean of the finds (last "
+            "find %.1f %.1f %.1f, camera %.1f %.1f %.1f, direction %.4f %.4f %.4f) to %s%s\n",
+            (unsigned long long)key, mean[0], mean[1], mean[2], moon_confirmed[0],
+            moon_confirmed[1], moon_confirmed[2], iv[3], iv[7], iv[11], moon_last[0], moon_last[1],
+            moon_last[2], moon_cache_path.c_str(), saved ? "" : " FAILED");
     }
 }
 
@@ -6000,7 +6757,15 @@ bool RayTracing::SkipShadowMaps() const {
 
 // The volume pass draws after our direct pass in the same frame, so the frame marker may
 // already be current (>=), unlike the AO and shadow draws that run before it.
-bool RayTracing::SkipHalfResLight(VideoCore::ImageId target, bool blended) const {
+bool RayTracing::SkipHalfResLight(VideoCore::ImageId target, bool blended, u64 ps_hash) const {
+    // Only moon (directional) and shadow-mapped lights: the game's shadow maps are skipped, so
+    // those draw unshadowed (the hard-edged DDirLight1 patch). Unshadowed lamp lights stay: with
+    // every half-res light gone the ground mist the game lights from this buffer turned into a
+    // flat grey veil over everything in it (Old Yharnam ravens, 2026-11-13).
+    const Rt::LightShader* shader = Rt::FindLightShader(ps_hash);
+    if (shader && shader->kind != Rt::LightKind::Directional && !shader->shadowed) {
+        return false;
+    }
     if (!blended || !target || !direct_written_diffuse || !enabled || !skip_volumes ||
         !direct_enabled || fog_stock || direct_debug == 3 || direct_written_frame + 1 < frame ||
         Rt::effects_paused.load(std::memory_order_relaxed)) {
@@ -6224,6 +6989,54 @@ void RayTracing::RecordAo(const SceneInputs& inputs) {
             "GXLightDeferredAO: %u rays, radius %.2f, normal %s, history %s\n",
             (unsigned long long)frame, mask_id.index, depth.width, depth.height, cells_x, cells_y,
             ao_rays, ao_radius, normal_valid ? "G-buffer" : "depth", history ? "reused" : "reset");
+    }
+}
+
+void RayTracing::ReadKeptProbe() {
+    if (!pick_ring.mapped || pick_ring.slot_bytes < Rt::KeptProbeBytes) {
+        return;
+    }
+    for (u32 s = 0; s < Slots; ++s) {
+        if (kept_probe_frame[s] == ~0ull || kept_probe_frame[s] == frame ||
+            !scheduler.IsFree(kept_probe_tick[s])) {
+            continue;
+        }
+        const u64 probed = kept_probe_frame[s];
+        kept_probe_frame[s] = ~0ull;
+        const u32 built = kept_probe_built[s];
+        if (built >= Slots || kept_snap_frame[built] != probed) {
+            continue; // that TLAS slot was built again since: its indices mean other instances
+        }
+        const u8* words = pick_ring.mapped + u64(s) * pick_ring.slot_bytes;
+        u32 count = 0;
+        std::memcpy(&count, words + Rt::KeptProbeBase * 4, 4);
+        count = std::min(count, Rt::KeptProbeMax);
+        ++kept_probe_reads;
+        kept_probe_hits += count;
+        const std::vector<u32>& snap = kept_snap[built];
+        for (u32 k = 0; k < count; ++k) {
+            u32 index = 0;
+            std::memcpy(&index, words + (Rt::KeptProbeBase + 1 + k) * 4, 4);
+            const u32 id = index < snap.size() ? snap[index] : ~0u;
+            Rt::CacheEntry* e = id != ~0u ? cache.ById(id) : nullptr;
+            if (!e || e->last_used >= probed) {
+                continue; // not an instance of that frame, or drawn again since the probe
+            }
+            if (e->probe_hidden <= e->last_used) {
+                ++kept_probe_hidden;
+                if (kept_probe_log_lines < 40) {
+                    ++kept_probe_log_lines;
+                    const Rt::DrawTag tag = id < entry_tags.size() ? entry_tags[id] : Rt::DrawTag{};
+                    Log("RT kept probe frame %llu: kept entry %u (%u triangles, ps %016llx, last "
+                        "drawn %llu frames ago) lies in front of the drawn surface: not kept until "
+                        "drawn again (BB_RT_KEPT_PROBE); %llu so far\n",
+                        (unsigned long long)probed, id, e->triangles,
+                        (unsigned long long)tag.ps, (unsigned long long)(probed - e->last_used),
+                        (unsigned long long)kept_probe_hidden);
+                }
+            }
+            e->probe_hidden = probed;
+        }
     }
 }
 
@@ -6521,7 +7334,7 @@ void RayTracing::OnLightComposite(const SceneInputs& inputs, u64 ps_hash) {
         TraceImage("scene depth", inputs.depth);
     }
     acc_frame = ~0ull;
-    light_keep_proj = {inputs.projection[0], inputs.projection[1]};
+    SetLightKeepCamera(inputs);
     if (light_capture && light_frame == frame) {
         EndLightFrame();
     }
@@ -6767,12 +7580,51 @@ void RayTracing::RecordDirect(const SceneInputs& inputs) {
                         restir_remap.data(), size_t(prev_light_count) * sizeof(u32));
         }
     }
+    // Moon visibility history (plain direct pass only; the ReSTIR passes own the reprojection
+    // params). The buffers are always bound there; the flag turns the shader step on.
+    bool moon_hist_on = false, moon_hist_valid = false;
+    if (!restir_enabled) {
+        if ((moon_hist_width != depth.width || moon_hist_height != depth.height) &&
+            !CreateMoonHistory(depth.width, depth.height)) {
+            skip("moon history allocation failed");
+            return;
+        }
+        moon_hist_on = moon_history && moon_half != 0 && !(mask_valid && moon_mask);
+        moon_hist_valid = moon_hist_on && moon_hist_frame + 1 == frame &&
+                          !Rt::CameraCut(moon_prev_inv_view, inputs.inv_view, 3.0f, 0.9f);
+        if (moon_hist_on && !moon_hist_valid) {
+            ++moon_hist_resets;
+        }
+    }
+    // The game's object motion (written by the G-buffer draws, complete here): the moon history
+    // follows moving objects with it instead of the camera path alone.
+    vk::ImageView object_view{};
+    bool object_valid = false;
+    if (moon_hist_valid && moon_object_motion && object_motion && object_motion->Enabled()) {
+        scheduler.EndRendering();
+        object_view = object_motion->PrepareRead(scheduler.CommandBuffer(), depth.width,
+                                                 depth.height, object_valid);
+        moon_object_frames += object_valid ? 1u : 0u;
+    }
+    const Rt::Affine& prev_inv_view = restir_enabled ? restir_prev_inv_view : moon_prev_inv_view;
+    const bool prev_reset = restir_enabled ? restir_reset : !moon_hist_valid;
+    const std::array<float, 4>& prev_projection =
+        restir_enabled ? restir_prev_projection : moon_prev_projection;
+    const std::array<float, 2>& prev_jitter = restir_enabled ? restir_prev_jitter : moon_prev_jitter;
     std::array<float, 2> pick_px{-1.0f, -1.0f};
     if (pick_enabled && pick_ring.mapped && !restir_enabled) {
         ReadPick();
         pick_px = {std::floor(pick_at[0] * float(depth.width - 1) + 0.5f),
                    std::floor(pick_at[1] * float(depth.height - 1) + 0.5f)};
         std::memset(pick_ring.mapped + u64(slot) * pick_ring.slot_bytes, 0, pick_ring.slot_bytes);
+    }
+    const bool kept_probe_on = kept_probe && pick_ring.mapped && !restir_enabled && !ptlas_on &&
+                               pick_ring.slot_bytes >= Rt::KeptProbeBytes &&
+                               built_slot < Slots && kept_snap_frame[built_slot] == frame;
+    if (kept_probe_on) {
+        ReadKeptProbe();
+        std::memset(pick_ring.mapped + u64(slot) * pick_ring.slot_bytes + Rt::KeptProbeBase * 4, 0,
+                    4);
     }
     fog_pick_px = {pick_px[0], pick_px[1], pick_px[0] >= 0.0f ? 1.0f : 0.0f, 0.0f};
     const bool water_keep_valid = water_direct_keep && glass_keep.view && glass_keep_frame == frame &&
@@ -6796,14 +7648,18 @@ void RayTracing::RecordDirect(const SceneInputs& inputs) {
                                  (moon_world ? 0u : Rt::DirectFlagMoonOwnSet) |
                                  (portal_instances ? Rt::DirectFlagPortals : 0u) |
                                  (water_keep_valid ? Rt::DirectFlagWaterKeep : 0u) |
+                                 (moon_hist_on ? Rt::DirectFlagMoonHistory : 0u) |
+                                 (moon_hist_valid ? Rt::DirectFlagMoonHistoryValid : 0u) |
+                                 (object_valid ? Rt::DirectFlagObjectMotion : 0u) |
+                                 (kept_probe_on ? Rt::DirectFlagKeptProbe : 0u) |
                                  Rt::MoonHalfFlags(moon_half, mask_valid && moon_mask, direct_debug)},
         .cfg = {(normal_valid ? normal_source.mode : Rt::NormalFromDepth) |
                     normal_source.swizzle << 8 | normal_source.components << 16,
                 u32(frame), direct_rays, direct_debug},
         .bias_tmin_gap_sets = {shadow_bias, shadow_tmin, shadow_gap, float(sets_valid ? direct_set_count : 0)},
-        .prev_proj = restir_prev_projection,
-        .reproject = Rt::Rows(restir_reset ? view : Rt::Reprojection(restir_prev_inv_view, inputs.inv_view)),
-        .prev_jitter = {restir_prev_jitter[0], restir_prev_jitter[1], water_keep_valid ? water_scatter : 0.0f, 0.0f},
+        .prev_proj = prev_projection,
+        .reproject = Rt::Rows(prev_reset ? view : Rt::Reprojection(prev_inv_view, inputs.inv_view)),
+        .prev_jitter = {prev_jitter[0], prev_jitter[1], water_keep_valid ? water_scatter : 0.0f, thin_transmit},
         .restir = {restir_candidates, restir_history, restir_spatial, prev_light_count},
         .shadow_color = {shadow_color[0], shadow_color[1], shadow_color[2], moon_cone_cos},
         .fx = {fx_smoke_opacity, float(fx_debug), pick_px[0], pick_px[1]},
@@ -6895,7 +7751,12 @@ void RayTracing::RecordDirect(const SceneInputs& inputs) {
     const vk::DescriptorBufferInfo pick_info{pick_ring.buffer, u64(slot) * pick_ring.slot_bytes,
                                              pick_ring.slot_bytes};
     const vk::DescriptorImageInfo water_keep_info = image(water_keep_valid ? *glass_keep.view : depth.view);
-    const std::array<vk::WriteDescriptorSet, 14> writes = {{
+    const DeviceBuffer& hist_in = moon_hist[moon_hist_index];
+    const DeviceBuffer& hist_out = moon_hist[moon_hist_index ^ 1u];
+    const vk::DescriptorBufferInfo hist_in_info{hist_in.buffer, 0, hist_in.size};
+    const vk::DescriptorBufferInfo hist_out_info{hist_out.buffer, 0, hist_out.size};
+    const vk::DescriptorImageInfo object_info = image(object_valid ? object_view : depth.view);
+    const std::array<vk::WriteDescriptorSet, 17> writes = {{
         write(0, Type::eSampledImage, &depth_info, nullptr),
         write(1, Type::eStorageImage, &diffuse_info, nullptr),
         write(2, Type::eStorageImage, &specular_info, nullptr),
@@ -6910,6 +7771,9 @@ void RayTracing::RecordDirect(const SceneInputs& inputs) {
         write(14, Type::eSampledImage, &mask_info, nullptr),
         write(15, Type::eStorageBuffer, nullptr, &pick_info),
         write(16, Type::eSampledImage, &water_keep_info, nullptr),
+        write(17, Type::eStorageBuffer, nullptr, &hist_in_info),
+        write(18, Type::eStorageBuffer, nullptr, &hist_out_info),
+        write(19, Type::eSampledImage, &object_info, nullptr),
     }};
     if (sets_valid) {
         Barrier(cmdbuf, Stage::eTransfer | Stage::eComputeShader | Stage::eHost,
@@ -6994,12 +7858,27 @@ void RayTracing::RecordDirect(const SceneInputs& inputs) {
         CrumbBegin(cmdbuf, Rt::Crumb::Direct);
         cmdbuf.dispatch(groups_x, groups_y, 1);
         CrumbEnd(cmdbuf, Rt::Crumb::Direct);
-        if (pick_px[0] >= 0.0f) {
+        if (moon_hist_on) {
+            moon_hist_index ^= 1u;
+            moon_hist_frame = frame;
+            moon_prev_inv_view = inputs.inv_view;
+            moon_prev_projection = inputs.projection;
+            moon_prev_jitter = inputs.jitter;
+            ++moon_hist_frames;
+        }
+        if (pick_px[0] >= 0.0f || kept_probe_on) {
             Barrier(cmdbuf, Stage::eComputeShader, Access::eShaderWrite, Stage::eHost,
                     Access::eHostRead);
+        }
+        if (pick_px[0] >= 0.0f) {
             pick_tick[slot] = scheduler.CurrentTick();
             pick_frame[slot] = frame;
             pick_built[slot] = built_slot;
+        }
+        if (kept_probe_on) {
+            kept_probe_tick[slot] = scheduler.CurrentTick();
+            kept_probe_frame[slot] = frame;
+            kept_probe_built[slot] = built_slot;
         }
     }
     Barrier(cmdbuf, Stage::eComputeShader, Access::eShaderWrite, Stage::eAllCommands,
@@ -7392,6 +8271,11 @@ void RayTracing::RecordReflect(const SceneInputs& inputs) {
         write(30, Type::eStorageBuffer, nullptr, &fog_table_info),
         write(31, Type::eCombinedImageSampler, &dome_info, nullptr),
     }};
+    if (g3_valid && (bounce_flags & Rt::BounceFlagDirSets) != 0u) {
+        RecordWorldSet(cmdbuf, depth.view, g3.view, sets_info, set_count, depth.width,
+                       depth.height, reflect_params_ring.buffer,
+                       u64(slot) * reflect_params_ring.slot_bytes);
+    }
     const float base_cut =
         reflect_first && direct_enabled ? std::clamp(ambient_spec_cut, 0.0f, 1.0f) : 0.0f;
     const GlassPush glass_push{
@@ -7426,6 +8310,8 @@ void RayTracing::RecordReflect(const SceneInputs& inputs) {
         .body = water_body,
         .sheen = water_sheen,
         .sheen_far = water_sheen_far,
+        .puddle_edge = water_puddle_edge,
+        .puddle_wet = water_puddle_wet,
     };
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *reflect_pipeline);
     cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *reflect_pipeline_layout, 1,
@@ -7459,7 +8345,14 @@ void RayTracing::OnAfterComposite(const SceneInputs& inputs) {
         Rt::effects_paused.load(std::memory_order_relaxed)) {
         return;
     }
-    light_keep_proj = {inputs.projection[0], inputs.projection[1]};
+    // With FSR 4.1 the composite shader also draws once before the scene colour target of the
+    // frame exists. GI waits for the real composite (or the post trigger): a skip here would
+    // reset the GI history every frame.
+    if (!scene_color) {
+        ++gi_early_composites;
+        return;
+    }
+    SetLightKeepCamera(inputs);
     if (light_capture && light_frame == frame) {
         EndLightFrame();
     }
@@ -7474,7 +8367,7 @@ void RayTracing::OnDispatch(u64 cs_hash, const SceneInputs& inputs) {
     if (!enabled || cs_hash != trigger_hash || last_post_frame == frame) {
         return;
     }
-    light_keep_proj = {inputs.projection[0], inputs.projection[1]};
+    SetLightKeepCamera(inputs);
     if (light_capture && light_frame == frame) {
         EndLightFrame();
     }
@@ -7490,6 +8383,7 @@ void RayTracing::OnDispatch(u64 cs_hash, const SceneInputs& inputs) {
         }
     }
     if (paused) {
+        RecordExposure(inputs, false);
         return;
     }
     last_post_frame = frame;
@@ -7509,6 +8403,10 @@ void RayTracing::OnDispatch(u64 cs_hash, const SceneInputs& inputs) {
     if (fog_enabled) {
         CpuTimer timer{hitch_log, hitch.gi};
         RecordFog(inputs);
+    }
+    if (gi_enabled) {
+        CpuTimer timer{hitch_log, hitch.gi};
+        RecordExposure(inputs, true);
     }
     if (debug_mode) {
         CpuTimer timer{hitch_log, hitch.debug};
@@ -7553,7 +8451,12 @@ void RayTracing::RecordSky(const SceneInputs& inputs) {
             Log("Ray tracing: sky pass skipped (%s)\n", why);
         }
     };
-    if (!SkyDomeLive()) {
+    // Where the game draws no dome (Upper Cathedral Ward: its sky is another shader's) only
+    // the moon search runs: it needs depth and scene colour, not the dome. Without it that
+    // map's moon was never looked for and the light stayed on the game's own direction.
+    const bool dome_live = SkyDomeLive();
+    if (!dome_live && !(moon_from_sky && sky_enabled && sky_pipeline && gi_enabled &&
+                        material.buffer)) {
         return;
     }
     const bool camera = inputs.camera_valid && inputs.projection[0] != 0.0f &&
@@ -7562,8 +8465,8 @@ void RayTracing::RecordSky(const SceneInputs& inputs) {
         skip("no scene colour, depth or camera this frame");
         return;
     }
-    VideoCore::Image* dome = texture_cache.TryGetImage(sky_dome_image, 0);
-    if (!dome || dome->image_uid != sky_dome_uid) {
+    VideoCore::Image* dome = dome_live ? texture_cache.TryGetImage(sky_dome_image, 0) : nullptr;
+    if (dome_live && (!dome || dome->image_uid != sky_dome_uid)) {
         skip("dome texture gone");
         sky_dome_frame = ~0ull;
         return;
@@ -7585,8 +8488,10 @@ void RayTracing::RecordSky(const SceneInputs& inputs) {
         skip("scene colour or depth not bindable at one size");
         return;
     }
-    runtime.Transit(dome, vk::ImageLayout::eShaderReadOnlyOptimal, Stage::eComputeShader,
-                    Access::eShaderRead);
+    if (dome) {
+        runtime.Transit(dome, vk::ImageLayout::eShaderReadOnlyOptimal, Stage::eComputeShader,
+                        Access::eShaderRead);
+    }
     runtime.FlushBarriers();
     const Rt::Affine view = Rt::InverseRigid(inputs.inv_view);
     Rt::SkyPush push{
@@ -7601,9 +8506,11 @@ void RayTracing::RecordSky(const SceneInputs& inputs) {
                                              .imageLayout = vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo scene_info{.imageView = color.view,
                                              .imageLayout = vk::ImageLayout::eGeneral};
-    const vk::DescriptorImageInfo dome_info{.sampler = *surface_sampler,
-                                            .imageView = sky_dome_view,
-                                            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
+    // No dome: the depth view stands in (the moon search does not sample the dome).
+    const vk::DescriptorImageInfo dome_info{
+        .sampler = *surface_sampler,
+        .imageView = dome ? sky_dome_view : depth.view,
+        .imageLayout = dome ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::eGeneral};
     const vk::DescriptorBufferInfo material_info{material.buffer, 0, material.size};
     using Type = vk::DescriptorType;
     const std::array<vk::WriteDescriptorSet, 4> writes = {{
@@ -7622,8 +8529,19 @@ void RayTracing::RecordSky(const SceneInputs& inputs) {
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *sky_pipeline_layout, 0, writes);
     cmdbuf.pushConstants(*sky_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
                          &push);
-    cmdbuf.dispatch(1, 1, 1);
-    if (sky_image) {
+    if (dome) {
+        cmdbuf.dispatch(1, 1, 1);
+    }
+    // The moon on screen (rt_sky.comp FindScreenMoon), for the layer search's next run.
+    if (moon_from_sky) {
+        Barrier(cmdbuf, Stage::eComputeShader, Access::eShaderWrite, Stage::eComputeShader,
+                Access::eShaderRead | Access::eShaderWrite);
+        push.cfg[2] = 3u;
+        cmdbuf.pushConstants(*sky_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                             sizeof(push), &push);
+        cmdbuf.dispatch(1, 1, 1);
+    }
+    if (sky_image && dome) {
         Barrier(cmdbuf, Stage::eComputeShader, Access::eShaderWrite, Stage::eComputeShader,
                 Access::eShaderRead | Access::eShaderWrite);
         push.cfg[2] = 2u;
@@ -7631,7 +8549,7 @@ void RayTracing::RecordSky(const SceneInputs& inputs) {
                              sizeof(push), &push);
         cmdbuf.dispatch((((depth.width + 1) / 2) * ((depth.height + 1) / 2) + 255) / 256, 1, 1);
     }
-    if (sky_debug) {
+    if (sky_debug && dome) {
         Barrier(cmdbuf, Stage::eComputeShader, Access::eShaderWrite, Stage::eComputeShader,
                 Access::eShaderRead | Access::eShaderWrite);
         push.cfg[2] = 1u;
@@ -7646,6 +8564,84 @@ void RayTracing::RecordSky(const SceneInputs& inputs) {
         Log("Ray tracing: sky dome light on (u = (%.3f + azimuth) x %.2f, v / %.0f), debug %u\n",
             sky_u_offset, sky_u_repeat, sky_v_divisor, sky_debug);
     }
+}
+
+void RayTracing::RecordExposure(const SceneInputs& inputs, bool apply) {
+    using Stage = vk::PipelineStageFlagBits2;
+    using Access = vk::AccessFlagBits2;
+    if (!exposure_pipeline || !exposure_ring.mapped || !scene_color || !inputs.depth) {
+        return;
+    }
+    const float* state = reinterpret_cast<const float*>(exposure_ring.mapped);
+    if (exposure_frames > 0 && exposure_frames % 120 == 0) {
+        Log("RT exposure: geometry log2 luminance %.2f, %.0f samples, boost %+.2f EV (x%.2f); "
+            "stock (F9) %.2f; key %.2f, max %.1f EV (BB_RT_EXPOSURE %s)\n",
+            state[1], state[2], state[0], state[3], state[4], exposure_key, exposure_max,
+            exposure_on ? "on" : "off");
+    }
+    ++exposure_frames;
+    if (apply && !exposure_on) {
+        exposure_reset = true;
+        return;
+    }
+    {
+        const auto& color = texture_cache.GetImage(scene_color);
+        if (color.info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
+            !(color.usage_flags & vk::ImageUsageFlagBits::eStorage)) {
+            return;
+        }
+    }
+    scheduler.EndRendering();
+    Bound color{}, depth{};
+    if (!BindScene(scene_color, inputs, Access::eShaderRead | Access::eShaderWrite, color) ||
+        !BindScene(inputs.depth, inputs, Access::eShaderRead, depth) ||
+        color.width != depth.width || color.height != depth.height) {
+        runtime.FlushBarriers();
+        return;
+    }
+    runtime.FlushBarriers();
+    ExposurePush push{
+        .size_cfg = {float(color.width), float(color.height), 0.0f, apply ? 1.0f : 0.0f},
+        .params = {exposure_key, exposure_max, exposure_rate, exposure_reset && apply ? 1.0f : 0.0f},
+        .tone = {exposure_white, 0.0f, 0.0f, 0.0f},
+    };
+    if (apply) {
+        exposure_reset = false;
+    }
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const vk::DescriptorImageInfo depth_info{.imageView = depth.view,
+                                             .imageLayout = vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo scene_info{.imageView = color.view,
+                                             .imageLayout = vk::ImageLayout::eGeneral};
+    const vk::DescriptorBufferInfo state_info{exposure_ring.buffer, 0, ExposureSlotBytes};
+    using Type = vk::DescriptorType;
+    const std::array<vk::WriteDescriptorSet, 3> writes = {{
+        {.dstBinding = 0, .descriptorCount = 1, .descriptorType = Type::eSampledImage,
+         .pImageInfo = &depth_info},
+        {.dstBinding = 1, .descriptorCount = 1, .descriptorType = Type::eStorageImage,
+         .pImageInfo = &scene_info},
+        {.dstBinding = 2, .descriptorCount = 1, .descriptorType = Type::eStorageBuffer,
+         .pBufferInfo = &state_info},
+    }};
+    Barrier(cmdbuf, Stage::eAllCommands, Access::eShaderWrite | Access::eColorAttachmentWrite,
+            Stage::eComputeShader, Access::eShaderRead | Access::eShaderWrite);
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *exposure_pipeline);
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *exposure_pipeline_layout, 0,
+                                writes);
+    cmdbuf.pushConstants(*exposure_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                         sizeof(push), &push);
+    cmdbuf.dispatch(1, 1, 1);
+    if (apply) {
+        Barrier(cmdbuf, Stage::eComputeShader, Access::eShaderWrite, Stage::eComputeShader,
+                Access::eShaderRead | Access::eShaderWrite);
+        push.size_cfg[2] = 1.0f;
+        cmdbuf.pushConstants(*exposure_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                             sizeof(push), &push);
+        cmdbuf.dispatch((color.width * color.height + 255) / 256, 1, 1);
+    }
+    Barrier(cmdbuf, Stage::eComputeShader, Access::eShaderWrite, Stage::eAllCommands,
+            Access::eShaderRead | Access::eShaderWrite | Access::eColorAttachmentRead |
+                Access::eColorAttachmentWrite | Access::eTransferRead);
 }
 
 void RayTracing::RecordFog(const SceneInputs& inputs) {
@@ -7972,9 +8968,13 @@ bool RayTracing::RecordGi(const SceneInputs& inputs) {
     const auto skip = [&](const char* why) {
         ++gi_skipped;
         static u64 printed = 0;
-        if (printed < 8) {
+        if (printed < 8 || gi_skipped % 600 == 0) {
             ++printed;
-            Log("Ray tracing: GI skipped (%s)\n", why);
+            Log("Ray tracing: GI skipped (%s) frame %llu, colour %d depth %d camera %d proj %g %g %g, "
+                "composite frame %llu\n",
+                why, (unsigned long long)frame, bool(scene_color), bool(inputs.depth),
+                int(inputs.camera_valid), inputs.projection[0], inputs.projection[1],
+                inputs.projection[3], (unsigned long long)gi_composite_frame);
         }
         history_valid = false;
     };
@@ -8165,7 +9165,7 @@ bool RayTracing::RecordGi(const SceneInputs& inputs) {
                 (normal_valid ? normal_source.mode : Rt::NormalFromDepth) |
                     normal_source.swizzle << 8 | normal_source.components << 16,
                 gi_debug},
-        .strength_bias = {gi_strength, gi_bias, 0.0f, 0.0f},
+        .strength_bias = {gi_strength, gi_bias, 0.0f, gi_fill_sky},
         .bounce = {gi_bounces_used, gi_bounce_rays, light_count, set_count},
         .bounce_cfg = {Rt::SkySlot(capacity.records), bounce_flags,
                        fog_bound ? gi_fog_bytes / 16u : 0u, 0u},
@@ -8327,6 +9327,10 @@ bool RayTracing::RecordGi(const SceneInputs& inputs) {
         write(21, Type::eStorageImage, &aux_hit_info, nullptr),
         write(27, Type::eSampledImage, &emissive_info, nullptr),
     }};
+    if (g3_valid && (bounce_flags & Rt::BounceFlagDirSets) != 0u) {
+        RecordWorldSet(cmdbuf, depth.view, g3.view, sets_info, set_count, depth.width,
+                       depth.height, params_ring.buffer, u64(slot) * params_ring.slot_bytes);
+    }
     const u32 groups_x = (color.width + 7) / 8, groups_y = (color.height + 7) / 8;
     if (restir_gi_enabled) {
         RecordRestirGi(inputs, depth, slot, flags, gi_writes, groups_x, groups_y);
@@ -8342,6 +9346,8 @@ bool RayTracing::RecordGi(const SceneInputs& inputs) {
     }
     // Same TLAS, params and descriptors as the GI pass; it only writes its own batch buffer.
     RecordFillVis(cmdbuf, gi_writes, view, slot);
+    // Same again; it writes only the layer grid and the moon slot of the material buffer.
+    RecordSkyLayer(cmdbuf, gi_writes);
 
     Barrier(cmdbuf, Stage::eComputeShader, Access::eShaderWrite | Access::eShaderRead,
             Stage::eComputeShader, Access::eShaderRead | Access::eShaderWrite);
@@ -8969,7 +9975,7 @@ void RayTracing::PrintStats(u32 triangles) {
                 "accepted, %llu over capacity, %llu invalid, %llu pool full; cache %zu "
                 "entries, %llu hits, %llu misses, %llu rebuilt, %llu evicted, %llu probe "
                 "dirty, pool %llu of %llu MiB (%llu retired); GI %llu frames, %llu skipped, "
-                "%llu history resets\n",
+                "%llu history resets, %llu early composites\n",
                 (unsigned long long)built_frames, (unsigned long long)empty_frames,
                 (unsigned long long)skipped_frames, triangles, last_instances, last_rebuilt,
                 geometry.Triangles(), geometry.IndexBytes() >> 10, max_triangles_seen,
@@ -8981,7 +9987,8 @@ void RayTracing::PrintStats(u32 triangles) {
                 (unsigned long long)c.probe_dirty, (unsigned long long)(pool.Used() >> 20),
                 (unsigned long long)(pool.Size() >> 20),
                 (unsigned long long)(retired_bytes >> 20), (unsigned long long)gi_frames,
-                (unsigned long long)gi_skipped, (unsigned long long)gi_resets);
+                (unsigned long long)gi_skipped, (unsigned long long)gi_resets,
+                (unsigned long long)gi_early_composites);
     LogLiveState();
     if (frame % gpu_line_frames == 0) {
         PrintGpuLine();
@@ -9000,6 +10007,11 @@ void RayTracing::PrintStats(u32 triangles) {
         light_cpu_frame = frame;
     }
     if (direct_enabled) {
+        Log("Ray tracing: moon history %s (BB_RT_MOON_HISTORY), %llu frames, %llu resets, "
+            "%llu with object motion (BB_RT_MOON_OBJECT_MOTION %s)\n",
+            moon_history ? "on" : "off", (unsigned long long)moon_hist_frames,
+            (unsigned long long)moon_hist_resets, (unsigned long long)moon_object_frames,
+            moon_object_motion ? "on" : "off");
         Log("Ray tracing: direct %llu frames (%llu skipped, %llu with a directional set, %llu "
             "from the game's GPU buffer, %llu GI/reflection frames from it, %llu CPU set readbacks), "
             "%zu lights this frame (%zu tracked, %llu duplicate "
@@ -9285,6 +10297,11 @@ void RayTracing::FinishFrame(const SceneInputs& inputs) {
                     fi.anchored = true;
                 }
                 late_entries.insert(fi.entry_id);
+                const VideoCore::Image* img =
+                    h.albedo_view ? texture_cache.TryGetImage(h.albedo_image, 0) : nullptr;
+                if (img && img->image_uid == h.albedo_uid) {
+                    OnDrawBound(h.albedo_view, h.albedo_image, h.albedo_uid, {}, {}, {}, {}, 0, 3);
+                }
             }
         }
         last_add_accepted = false;
@@ -9448,6 +10465,14 @@ void RayTracing::OnDrawBound(vk::ImageView albedo_view, VideoCore::ImageId image
                              vk::ImageView normal_view, VideoCore::ImageId normal_image,
                              vk::ImageView alpha_view, VideoCore::ImageId alpha_image,
                              u64 alpha_uid, u32 alpha_channel) {
+    if (std::exchange(last_add_late, false)) {
+        if (!late_held.empty() && albedo_view && image) {
+            late_held.back().albedo_view = albedo_view;
+            late_held.back().albedo_image = image;
+            late_held.back().albedo_uid = uid;
+        }
+        return;
+    }
     if (!enabled || !surface_enabled || !last_add_accepted || instances.empty()) {
         return;
     }
@@ -9814,7 +10839,8 @@ vk::DescriptorSet RayTracing::SurfaceSet(vk::CommandBuffer cmdbuf, u32 slot) {
     for (size_t i = 0; i < refs.size(); ++i) {
         const TextureRef& ref = refs[i];
         const VideoCore::Image* now = ref.id ? texture_cache.TryGetImage(ref.id, 0) : nullptr;
-        const bool alive = Rt::SurfaceTextureAlive(u32(i), u64(VkImageView(ref.view)), ref.id.index,
+        const bool alive = (i && ref.own && ref.view) ||
+                           Rt::SurfaceTextureAlive(u32(i), u64(VkImageView(ref.view)), ref.id.index,
                                                    ref.uid, now ? now->image_uid : 0);
         if (i && !alive) {
             ++surface_dead;
@@ -9836,6 +10862,228 @@ vk::DescriptorSet RayTracing::SurfaceSet(vk::CommandBuffer cmdbuf, u32 slot) {
     }
     surface_last = {ring.set, ring.tick, slot};
     return ring.set;
+}
+
+void RayTracing::GlassMaskSlots(vk::CommandBuffer cmdbuf) {
+    if (!glass_on || !glass_pass || glass_ps.empty() || !surface_enabled || glass_mask_dir.empty()) {
+        return;
+    }
+    for (FrameInstance& fi : instances) {
+        fi.glass_mask = 0;
+        if (!fi.texture || !fi.uid || fi.alpha_test || !Rt::HashListed(glass_ps, fi.tag.ps, 0)) {
+            continue;
+        }
+        // Small draws too: an all-black mask turns a listed draw that is no glass (the workshop
+        // mirror, ca7226ec, 8 triangles) back into an opaque surface.
+        const Rt::CacheEntry* e = cache.ById(fi.entry_id);
+        if (!e) {
+            continue;
+        }
+        auto it = glass_mask_by_uid.find(fi.uid);
+        if (it == glass_mask_by_uid.end()) {
+            const VideoCore::Image* image =
+                texture_cache.TryGetImage(VideoCore::ImageId{fi.image}, fi.uid);
+            if (!image || !image->info.guest_address || !image->info.guest_size) {
+                continue;
+            }
+            const u64 hash = XXH3_64bits(std::bit_cast<const u8*>(image->info.guest_address),
+                                         image->info.guest_size);
+            auto known = glass_mask_by_hash.find(hash);
+            if (known == glass_mask_by_hash.end()) {
+                known = glass_mask_by_hash.emplace(hash, GlassMaskLoad(cmdbuf, hash)).first;
+            }
+            it = glass_mask_by_uid.emplace(fi.uid, known->second).first;
+            Log("RT glass mask: ps %08llx %u tris albedo %016llx %ux%u fmt %d -> %s\n",
+                (unsigned long long)fi.tag.ps, e->triangles, (unsigned long long)hash,
+                image->info.size.width, image->info.size.height, int(image->info.pixel_format),
+                known->second >= 0 ? "masked" : "no mask");
+            if (glass_mask_dump && glass_mask_dumped.insert(hash).second) {
+                GlassMaskDump(cmdbuf, *image, hash);
+            }
+        }
+        if (it->second < 0) {
+            continue;
+        }
+        const vk::ImageView view = *glass_mask_images[it->second].view;
+        const u32 mask_slot = SurfaceSlot(view, VideoCore::ImageId{});
+        auto& refs = slot_textures[u32(frame % Slots)];
+        if (mask_slot && mask_slot < refs.size() && refs[mask_slot].view == view) {
+            refs[mask_slot].own = true;
+            fi.glass_mask = mask_slot;
+        }
+    }
+}
+
+s32 RayTracing::GlassMaskLoad(vk::CommandBuffer cmdbuf, u64 hash) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "%016llx.pgm", (unsigned long long)hash);
+    const std::filesystem::path file = std::filesystem::path(glass_mask_dir) / name;
+    std::error_code ec;
+    const s64 stamp = s64(std::filesystem::last_write_time(file, ec).time_since_epoch().count());
+    if (ec) {
+        return -1;
+    }
+    // An unchanged file keeps its image; an edited one is uploaded again.
+    if (const auto it = glass_mask_files.find(hash); it != glass_mask_files.end() && it->second.first == stamp) {
+        return it->second.second;
+    }
+    std::ifstream in(file, std::ios::binary);
+    if (!in) {
+        return -1;
+    }
+    std::string magic;
+    u32 width = 0, height = 0, maxval = 0;
+    in >> magic >> width >> height >> maxval;
+    in.get();
+    if (magic != "P5" || !width || !height || width > 8192 || height > 8192 || maxval != 255) {
+        Log("RT glass mask: %s is not an 8-bit binary PGM\n", name);
+        return -1;
+    }
+    std::vector<u8> pixels(size_t(width) * height);
+    if (!in.read(reinterpret_cast<char*>(pixels.data()), std::streamsize(pixels.size()))) {
+        Log("RT glass mask: %s is short\n", name);
+        return -1;
+    }
+    OwnImage own;
+    if (!MakeOwnImage(own, vk::Format::eR8Unorm, width, height,
+                      vk::ImageUsageFlagBits::eTransferDst)) {
+        Log("RT glass mask: no image for %s\n", name);
+        return -1;
+    }
+    const VkBufferCreateInfo buffer_ci{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = pixels.size(),
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+    };
+    const VmaAllocationCreateInfo alloc_ci{
+        .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+    };
+    VkBuffer buffer{};
+    VmaAllocation allocation{};
+    VmaAllocationInfo info{};
+    const VmaAllocator allocator = instance.GetAllocator();
+    if (vmaCreateBuffer(allocator, &buffer_ci, &alloc_ci, &buffer, &allocation, &info) != VK_SUCCESS) {
+        return -1;
+    }
+    std::memcpy(info.pMappedData, pixels.data(), pixels.size());
+    vmaFlushAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
+    using Stage = vk::PipelineStageFlagBits2;
+    using Access = vk::AccessFlagBits2;
+    const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+    const vk::ImageMemoryBarrier2 to_dst{
+        .srcStageMask = Stage::eTopOfPipe,
+        .dstStageMask = Stage::eTransfer,
+        .dstAccessMask = Access::eTransferWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eTransferDstOptimal,
+        .image = vk::Image(own.image),
+        .subresourceRange = range,
+    };
+    cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_dst});
+    const vk::BufferImageCopy region{
+        .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .imageExtent = {width, height, 1},
+    };
+    cmdbuf.copyBufferToImage(buffer, vk::Image(own.image), vk::ImageLayout::eTransferDstOptimal,
+                             region);
+    const vk::ImageMemoryBarrier2 to_general{
+        .srcStageMask = Stage::eTransfer,
+        .srcAccessMask = Access::eTransferWrite,
+        .dstStageMask = Stage::eAllCommands,
+        .dstAccessMask = Access::eShaderRead,
+        .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .image = vk::Image(own.image),
+        .subresourceRange = range,
+    };
+    cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_general});
+    scheduler.DeferPriorityOperation(
+        [allocator, buffer, allocation] { vmaDestroyBuffer(allocator, buffer, allocation); });
+    own.written = true;
+    glass_mask_images.push_back(std::move(own));
+    glass_mask_files[hash] = {stamp, s32(glass_mask_images.size() - 1)};
+    Log("RT glass mask: loaded %s (%ux%u)\n", name, width, height);
+    return s32(glass_mask_images.size() - 1);
+}
+
+void RayTracing::GlassMaskDump(vk::CommandBuffer cmdbuf, const VideoCore::Image& image, u64 hash) {
+    const vk::Format format = image.info.pixel_format;
+    const u32 width = image.info.size.width, height = image.info.size.height;
+    // BC1-BC7 (4x4 blocks of 8 or 16 bytes) and 8-bit RGBA/BGRA; anything else is not dumped.
+    const int f = int(format);
+    const bool bc = f >= 131 && f <= 146;
+    const std::array<u32, 2> extent{bc ? 4u : 1u, bc ? 4u : 1u};
+    const u32 block = bc ? ((f <= 134 || f == 139 || f == 140) ? 8u : 16u) : (f >= 37 && f <= 50) ? 4u : 0u;
+    const vk::ImageLayout layout = image.backing ? image.backing->state.layout : vk::ImageLayout::eUndefined;
+    if (!block || layout == vk::ImageLayout::eUndefined) {
+        Log("RT glass mask: no dump of %016llx (fmt %d layout %d)\n", (unsigned long long)hash,
+            int(format), int(layout));
+        return;
+    }
+    const VkDeviceSize size = VkDeviceSize((width + extent[0] - 1) / extent[0]) *
+                              ((height + extent[1] - 1) / extent[1]) * block;
+    const VkBufferCreateInfo buffer_ci{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    };
+    const VmaAllocationCreateInfo alloc_ci{
+        .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+    };
+    VkBuffer buffer{};
+    VmaAllocation allocation{};
+    VmaAllocationInfo info{};
+    const VmaAllocator allocator = instance.GetAllocator();
+    if (vmaCreateBuffer(allocator, &buffer_ci, &alloc_ci, &buffer, &allocation, &info) != VK_SUCCESS) {
+        return;
+    }
+    // The texture stays in its own layout for the game: to transfer-src for the copy and back.
+    const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+    const vk::ImageMemoryBarrier2 to_src{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        .oldLayout = layout,
+        .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+        .image = image.GetImage(),
+        .subresourceRange = range,
+    };
+    cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_src});
+    const vk::BufferImageCopy region{
+        .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .imageExtent = {width, height, 1},
+    };
+    cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal, buffer, region);
+    const vk::ImageMemoryBarrier2 back{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+        .newLayout = layout,
+        .image = image.GetImage(),
+        .subresourceRange = range,
+    };
+    cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &back});
+    const std::filesystem::path dir = std::filesystem::path(glass_mask_dir) / "dump";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    char name[96];
+    std::snprintf(name, sizeof(name), "%016llx_%ux%u_%d.raw", (unsigned long long)hash, width,
+                  height, int(format));
+    scheduler.DeferPriorityOperation([allocator, buffer, allocation, info, size,
+                                      file = (dir / name).string()] {
+        vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
+        if (FILE* f = std::fopen(file.c_str(), "wb")) {
+            std::fwrite(info.pMappedData, 1, size, f);
+            std::fclose(f);
+        }
+        vmaDestroyBuffer(allocator, buffer, allocation);
+    });
+    Log("RT glass mask: dumped %s\n", name);
 }
 
 void RayTracing::WriteSurfaces(u32 slot) {
@@ -9870,6 +11118,11 @@ void RayTracing::WriteSurfaces(u32 slot) {
             }
         }
         record.flags |= glass_bit | portal_bit | water_bit;
+        record.flags2 = fi.tag.cull != 0u ? Rt::Surface2OneSided : 0u;
+        if (fi.glass_mask && surface_enabled && !fi.alpha_test) {
+            record.flags |= Rt::SurfaceGlass;
+            record.alpha_ref = -float(fi.glass_mask);
+        }
         if (const Rt::CacheEntry* e = cache.ById(fi.entry_id); e && (e->skinned || e->palette)) {
             record.flags |= Rt::SurfaceSkinned;
         }

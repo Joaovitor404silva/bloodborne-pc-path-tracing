@@ -288,7 +288,8 @@ def step_release(c, a):
     git(ROOT, "add", "-A", "README.md", "installer", "tools", "source", ".gitattributes")
     msg = os.path.join(WORK, "commit-msg.txt")
     with open(msg, "w", encoding="utf-8", newline="\n") as f:
-        f.write(f"{a.rt}: Bloodborne PC {a.base}\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n"
+        coauthor = os.environ.get("CLAUDE_COAUTHOR", "Claude Opus 5.5 <noreply@anthropic.com>")
+        f.write(f"{a.rt}: Bloodborne PC {a.base}\n\nCo-Authored-By: {coauthor}\n"
                 + (f"Claude-Session: {os.environ['CLAUDE_SESSION']}\n" if os.environ.get("CLAUDE_SESSION") else ""))
     run(["git", "-C", ROOT, "-c", "user.name=Joao vitor alves",
          "-c", "user.email=177051894+Joaovitor404silva@users.noreply.github.com", "commit", "-q", "-F", msg])

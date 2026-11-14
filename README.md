@@ -18,12 +18,12 @@ moonlight and bounce light, traced shadows and reflections, water and puddle mir
 ## Download
 
 **[Download the latest release](https://github.com/Joaovitor404silva/bloodborne-pc-path-tracing/releases/latest)**
-(`Bloodborne-PC-Path-Tracing-pt2.2.zip`).
+(`Bloodborne-PC-Path-Tracing-pt2.3.zip`).
 
 ## Needs
 
-- Bloodborne PC **1.9.8.4** (SuperMedo), installed and working:
-  [windows-v1.9.8.4](https://github.com/Supermedo/bloodborne_pc/releases/tag/windows-v1.9.8.4)
+- Bloodborne PC **1.9.8.6** (SuperMedo), installed and working:
+  [windows-v1.9.8.6](https://github.com/Supermedo/bloodborne_pc/releases/tag/windows-v1.9.8.6)
 - A ray tracing GPU: GeForce RTX or Radeon RX 6000 and newer.
 - Your own copy of the game. No game files are included.
 
@@ -51,7 +51,7 @@ Extra variables. The installer writes it for you.
 In game, press **F9** to turn path tracing off and on and compare with the stock lighting.
 Give it about 3 seconds after each press while the exposure adjusts.
 
-The installer checks the folder is 1.9.8.4, backs up the 3 files it replaces to `rt-backup`,
+The installer checks the folder is 1.9.8.6, backs up the 3 files it replaces to `rt-backup`,
 copies the 4 files and checks each by SHA-256. It adds the path tracing variables to the
 launcher's Extra variables and keeps any you already had.
 
@@ -92,15 +92,15 @@ Reconstruction DLL, takes the variables out of Extra variables and puts your old
 - Files we wrote are there as they are: the path tracer
   (`source/gpu/shadps4/video_core/renderer_vulkan/rt/`), its shaders
   (`source/gpu/shadps4/video_core/host_shaders/rt_*.comp`), tests and tools.
-- Our changes to his files are one patch: `source/supermedo-1.9.8.4.patch`.
+- Our changes to his files are one patch: `source/supermedo-1.9.8.6.patch`.
 
 Rebuild the exact pt2 tree:
 
 ```
-git clone --recursive --branch windows-v1.9.8.4 https://github.com/Supermedo/bloodborne_pc
+git clone --recursive --branch windows-v1.9.8.6 https://github.com/Supermedo/bloodborne_pc
 git clone https://github.com/Joaovitor404silva/bloodborne-pc-path-tracing
 cp -r bloodborne-pc-path-tracing/source/. bloodborne_pc/
-cd bloodborne_pc && git apply supermedo-1.9.8.4.patch
+cd bloodborne_pc && git apply supermedo-1.9.8.6.patch
 ```
 
 Then build on Windows (MSYS2 CLANG64) as in his `packaging/windows/README.md`: `bash build.sh`

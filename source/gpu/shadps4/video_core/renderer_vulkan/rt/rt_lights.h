@@ -142,6 +142,7 @@ struct LightDrawState {
     bool valid{};
     uint32_t diffuse{NoLightTarget};
     uint32_t specular{NoLightTarget};
+    uint32_t width{}; // diffuse target width in pixels (0 = unknown)
     uint8_t mask0{};
     uint8_t mask1{};
     bool blend0{};
@@ -196,6 +197,9 @@ struct Light {
     // An enclosed lamp (glass housing, BB_RT_LAMP_ENCLOSED): its own reach, and no stock depth
     // test, which would clip that reach back to the game's sphere.
     bool lamp{};
+    // A bright emitter whose reach grew with its intensity (BB_RT_EMITTER_BRIGHT): no stock
+    // depth test either, for the same reason as a lamp.
+    bool wide{};
     bool held{};
     // A glow lamp (post lamp, no game light) inside its glass: it does not light its own housing
     // (flag 16, Rt::HousingFade in the shaders).
@@ -436,8 +440,12 @@ inline uint32_t ApplyDrawState(const LightDrawRecord& rec, uint32_t draw, std::s
 struct LightTargets {
     uint32_t diffuse{NoLightTarget};
     uint32_t specular{NoLightTarget};
+    uint32_t width{};
 };
 
+// The scene's light buffers: the widest target pair, then the one with the most light draws.
+// Some areas also light a smaller capture view (its lights 90+ m from the camera) with more
+// draws than the scene; a count alone then dropped every scene light, the held torch too.
 inline LightTargets MainLightTargets(std::span<const LightDrawRecord> draws) {
     LightTargets best{};
     uint32_t best_count = 0;
@@ -450,9 +458,9 @@ inline LightTargets MainLightTargets(std::span<const LightDrawRecord> draws) {
         for (const LightDrawRecord& r : draws) {
             count += r.state.valid && r.state.diffuse == a.diffuse && r.state.specular == a.specular;
         }
-        if (count > best_count) {
+        if (a.width > best.width || (a.width == best.width && count > best_count)) {
             best_count = count;
-            best = {a.diffuse, a.specular};
+            best = {a.diffuse, a.specular, a.width};
         }
     }
     return best;
@@ -969,6 +977,13 @@ constexpr float HeldCameraDistance = 6.0f;
 
 constexpr float LanternGreen = 0.7f;
 constexpr float LanternBlue = 0.4f;
+// The lamps the warm rule is for are a pale warm (blue 0.5 x red: 2.000 1.356 0.997). The
+// Hunter's Dream's designer key fills are a saturated amber (2.000 1.243 0.352, 2.000 1.110
+// 0.603: blue 0.18 and 0.30 x red), the mirror of its blue fills (0.586 1.243 2.000), steady and
+// with nothing around them. Bigger than lamp-bright, a light is a fire (the burning house's
+// 12.800 5.039 0.806) and needs no hue.
+constexpr float WarmLampBlue = 0.4f;
+constexpr float WarmFirePeak = 3.0f;
 
 // A flame is clearly redder than green (game flames: green <= 0.76 x red). Loot lights are
 // neutral (0.817 0.817 0.636) yet move with the corpse, glow on screen and sit enclosed,
@@ -989,9 +1004,10 @@ inline bool FlameColour(const Light& l) {
     return l.color[0] > 0.0f && l.color[1] <= FlameGreenMax * l.color[0];
 }
 
-inline bool WarmEmitter(const Light& l) {
+inline bool WarmEmitter(const Light& l, float lamp_blue = WarmLampBlue) {
     const float r = l.color[0];
-    if (r >= WarmEmitterRed && l.color[2] < WarmEmitterBlue * r) {
+    if (r >= WarmEmitterRed && l.color[2] < WarmEmitterBlue * r &&
+        (l.color[2] >= lamp_blue * r || r > WarmFirePeak)) {
         return true;
     }
     return r > 0.0f && l.color[1] >= LanternGreen * r && l.color[2] <= LanternBlue * r;

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "bbrt": {
+      "command": "D:/modding/bbport-rt-perfall/out/vision-venv/Scripts/python.exe",
+      "args": ["D:/modding/bbport-rt-perfall/tools/bbrt_mcp.py"]
+    }
+  }
+}

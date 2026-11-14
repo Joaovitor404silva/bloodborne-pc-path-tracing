@@ -908,6 +908,17 @@ void TestKeepInstances() {
     e.valid = false;
     assert(!KeepInstance(e, 101, near, rules));
     e.valid = true;
+    // Seen by the kept probe in front of the drawn surface after its last draw: not kept, unless
+    // the probe rule is off; drawn again afterwards, kept again.
+    e.probe_hidden = 105;
+    assert(!KeepInstance(e, 110, near, rules));
+    rules.probe_hide = false;
+    assert(KeepInstance(e, 110, near, rules));
+    rules.probe_hide = true;
+    e.last_used = 106;
+    assert(KeepInstance(e, 110, near, rules));
+    e.last_used = 100;
+    e.probe_hidden = 0;
     e.updatable = true;
     assert(KeepInstance(e, 103, near, rules));
     assert(!KeepInstance(e, 104, near, rules));

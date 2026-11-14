@@ -172,13 +172,20 @@ constexpr uint32_t SurfaceSkinned = 1u << 29;
 constexpr uint32_t SurfacePortal = 1u << 30;
 constexpr uint32_t SurfaceWater = 1u << 31;
 
+// flags2 bits.
+// Drawn with face culling on: a closed solid, never a two-sided card. rt_direct.comp ThinCard only
+// takes a back-face camera hit as a card when this is clear (a mirrored or reversed-winding wall
+// mesh shows the camera its TLAS back face and let the moon through, Cathedral Ward coffin alcove).
+constexpr uint32_t Surface2OneSided = 1;
+
 struct SurfaceRecord {
     uint32_t texture{};
     uint32_t flags{};
     uint32_t uv_base{NoUv};
     float alpha_ref{0.5f};
+    uint32_t flags2{};
 };
-static_assert(sizeof(SurfaceRecord) == 16);
+static_assert(sizeof(SurfaceRecord) == 20);
 
 constexpr uint32_t UvSelect(int32_t param, uint32_t component_u, uint32_t component_v) {
     if (param < 0 || param > 31 || component_u > 3 || component_v > 3) {

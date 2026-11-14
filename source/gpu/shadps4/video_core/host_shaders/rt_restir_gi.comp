@@ -61,6 +61,7 @@ struct SurfaceRecord {
     uint flags;
     uint uv_base;
     float alpha_ref;
+    uint flags2;
 };
 layout(binding = 15, std430) readonly buffer Surfaces {
     SurfaceRecord surfaces[];
@@ -103,6 +104,33 @@ bool AlphaTestPasses(uint instance, uint primitive, vec2 barycentrics) {
     const vec2 uv = a * (1.0 - barycentrics.x - barycentrics.y) + b * barycentrics.x + c * barycentrics.y;
     const float alpha = textureLod(surface_textures[nonuniformEXT(alpha_tex)], uv, 0.0)[SurfaceAlphaChannel(r)];
     return !(alpha < r.alpha_ref);
+}
+
+// Glass at a hit: SurfaceGlass records. A masked one (alpha_ref < 0, RayTracing::GlassMaskSlots)
+// is glass only where its hand-painted mask (texture slot -alpha_ref) is white: the bottle
+// shelves mix glass and metal in one mesh.
+bool GlassAt(uint instance, uint primitive, vec2 barycentrics) {
+    if (instance >= surfaces.length()) {
+        return false;
+    }
+    const SurfaceRecord r = surfaces[instance];
+    if ((r.flags & 0x10000000u) == 0u) {
+        return false;
+    }
+    if (!(r.alpha_ref < 0.0)) {
+        return true;
+    }
+    const uint slot = uint(-r.alpha_ref + 0.5);
+    const uint base = r.uv_base + primitive * TriangleWords;
+    if (slot == 0u || slot >= MaxSurfaceTextures || (r.flags & 2u) == 0u ||
+        base + 2u >= uv_pool.length()) {
+        return false;
+    }
+    const vec2 a = unpackHalf2x16(uv_pool[base]);
+    const vec2 b = unpackHalf2x16(uv_pool[base + 1u]);
+    const vec2 c = unpackHalf2x16(uv_pool[base + 2u]);
+    const vec2 uv = a * (1.0 - barycentrics.x - barycentrics.y) + b * barycentrics.x + c * barycentrics.y;
+    return textureLod(surface_textures[nonuniformEXT(slot)], uv, 0.0).r > 0.5;
 }
 
 const uint FlagReset = 1u;
@@ -301,7 +329,6 @@ void Store(ivec2 pixel, Reservoir r, vec3 n, float z) {
     imageStore(out_recv, pixel, vec4(n, z));
 }
 
-const uint SurfaceGlassPane = 0x10000000u;
 const uint MaskSolid = 0x01u;
 const uint MaskPortal = 0x08u;
 const float PortalWall = 1.5;
@@ -315,11 +342,12 @@ bool BlockedSpan(vec3 origin, vec3 dir, float t_min, float t_max) {
             continue;
         }
         const uint instance = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(q, false));
-        if (instance < surfaces.length() && (surfaces[instance].flags & SurfaceGlassPane) != 0u) {
+        const uint primitive = uint(rayQueryGetIntersectionPrimitiveIndexEXT(q, false));
+        const vec2 b = rayQueryGetIntersectionBarycentricsEXT(q, false);
+        if (GlassAt(instance, primitive, b)) {
             continue;
         }
-        if (AlphaTestPasses(instance, uint(rayQueryGetIntersectionPrimitiveIndexEXT(q, false)),
-                            rayQueryGetIntersectionBarycentricsEXT(q, false))) {
+        if (AlphaTestPasses(instance, primitive, b)) {
             rayQueryConfirmIntersectionEXT(q);
         }
     }
@@ -406,8 +434,13 @@ void main() {
         const vec3 origin = p + n * (Bias() + abs(p.z) * 2e-4);
         const vec3 d = r.position - origin;
         const float len = length(d);
+        // A blocked neighbour sample used to zero the whole reservoir, so in dense foliage
+        // (Hemwick's lily field, most neighbours' sky samples hidden by the next flower) GI lost
+        // about a quarter of its energy. Fall back to this pixel's own sample instead.
         if (len > 1e-3 && Blocked(origin, d / len, max(len - Gap(), 1e-3))) {
-            target = 0.0;
+            r = center;
+            r.w_sum = center.M > 0.0 ? center_pdf * center.W * center.M : 0.0;
+            target = center_pdf;
         }
     }
     Finalize(r, target);

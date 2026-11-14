@@ -174,6 +174,9 @@ struct CacheEntry {
     uint32_t alpha_channel{3};
     uint64_t normal_view{}, normal_uid{};
     uint32_t normal_image{};
+    // Frame a camera ray found this entry, kept, in front of the drawn surface (BB_RT_KEPT_PROBE):
+    // the game draws something else there now, so it is not kept until the game draws it again.
+    uint64_t probe_hidden{};
 };
 
 constexpr bool RememberSurface(bool texture_slot, bool alpha_slot) {
@@ -187,6 +190,7 @@ struct KeepRules {
     uint64_t kept_unused_frames{120};
     uint64_t triangle_budget{};
     uint32_t max_triangles{};
+    bool probe_hide{true}; // CacheEntry::probe_hidden counts (BB_RT_KEPT_PROBE)
 };
 
 struct KeptPick {
@@ -209,7 +213,8 @@ inline bool KeepShortLived(const CacheEntry& e) {
 
 inline bool KeepInstance(const CacheEntry& e, uint64_t frame, const std::array<float, 3>& camera,
                          const KeepRules& k) {
-    if (!e.valid || e.dirty || e.last_used >= frame || !KeepNear(e, camera, k)) {
+    if (!e.valid || e.dirty || e.last_used >= frame || !KeepNear(e, camera, k) ||
+        (k.probe_hide && e.probe_hidden > e.last_used)) {
         return false;
     }
     if (KeepShortLived(e)) {

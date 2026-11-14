@@ -55,7 +55,11 @@ layout(binding = 5, rgba16f) uniform writeonly image2D history_out;
 layout(binding = 6, r32f) uniform writeonly image2D history_z_out;
 layout(binding = 7, rgba16f) uniform writeonly image2D raw_out;
 
-layout(binding = 9, std430) readonly buffer Material {
+layout(binding = 9, std430)
+#ifndef RT_SKY_LAYER
+readonly
+#endif
+buffer Material {
     vec4 material[];
 };
 layout(binding = 10, std430) buffer Accum {
@@ -66,6 +70,7 @@ struct SurfaceRecord {
     uint flags;
     uint uv_base;
     float alpha_ref;
+    uint flags2;
 };
 layout(binding = 11, std430) readonly buffer Surfaces {
     SurfaceRecord surfaces[];
@@ -145,6 +150,8 @@ layout(push_constant) uniform GlassPush {
     float body;
     float sheen;
     float sheen_far;
+    float puddle_edge;
+    float puddle_wet;
 } glass_push;
 layout(binding = 30, std430) readonly buffer FogSets {
     vec4 fog_sets[];
@@ -172,6 +179,13 @@ const float PuddleBump = 0.25;
 const uint SurfaceGlass = 0x10000000u;
 const float GlassDepthWindow = 0.01;
 const float GlassDepthSlack = 0.03;
+// A pane with an opaque surface this close behind it is a mirror (glass on its backing: the
+// workshop mirror's backing is 4.1 cm behind), not a window; the wardrobe panes have only their
+// own glass back face 2 cm behind.
+const float GlassBackedGap = 0.05;
+// Such a backed pane is a silvered mirror: a sharp lobe with an old silver mirror's reflectance
+// (fresh silver behind glass ~0.9; the workshop mirror is aged and dirty).
+const float MirrorF0 = 0.7;
 const float GlassCoverLo = 0.06;
 const float GlassCoverHi = 0.25;
 const float WaterRealF0 = 0.02;
@@ -234,13 +248,9 @@ const float WispGain = 0.8;
 const uint SurfaceSkinned = 0x20000000u; // rt_surface.h SurfaceSkinned
 // Glass panes (SurfaceGlass, BB_RT_GLASS_PS draws; their instances are forced non-opaque) let
 // light through: bounce, sky and shadow rays go on past them, losing GlassTransmit.
-const uint SurfaceGlassPane = 0x10000000u; // rt_surface.h SurfaceGlass
 const float GlassTransmit = 0.85;
 bool trace_through_glass = false;
 float trace_cap = 1e6;
-bool IsGlassPane(uint instance) {
-    return instance < surfaces.length() && (surfaces[instance].flags & SurfaceGlassPane) != 0u;
-}
 const float SmokeGiOpacity = 0.6;
 const uint TriangleWords = 8u;
 const uint SurfaceNormalMapShift = 16u;
@@ -333,6 +343,8 @@ uint LightCount() { return bounce.z; }
 uint DirSetCount() { return bounce.w; }
 uint SkySlot() { return bounce_cfg.x; }
 uint BounceFlags() { return bounce_cfg.y; }
+// World set + 1 written by rt_world_set.comp, 0 = none (use the pixel's own set).
+uint WorldSet() { return sharc.w; }
 float EmissiveLuma() { return bounce_misc.x; }
 float BounceGap() { return bounce_misc.y; }
 uint TraceCfg() { return uint(max(bounce_misc.z, 0.0) + 0.5); }
@@ -459,6 +471,33 @@ bool AlphaTestPasses(uint instance, uint primitive, vec2 barycentrics) {
     return !(alpha < r.alpha_ref);
 }
 
+// Glass at a hit: SurfaceGlass records. A masked one (alpha_ref < 0, RayTracing::GlassMaskSlots)
+// is glass only where its hand-painted mask (texture slot -alpha_ref) is white: the bottle
+// shelves mix glass and metal in one mesh.
+bool GlassAt(uint instance, uint primitive, vec2 barycentrics) {
+    if (instance >= surfaces.length()) {
+        return false;
+    }
+    const SurfaceRecord r = surfaces[instance];
+    if ((r.flags & 0x10000000u) == 0u) {
+        return false;
+    }
+    if (!(r.alpha_ref < 0.0)) {
+        return true;
+    }
+    const uint slot = uint(-r.alpha_ref + 0.5);
+    const uint base = r.uv_base + primitive * TriangleWords;
+    if (slot == 0u || slot >= MaxSurfaceTextures || (r.flags & 2u) == 0u ||
+        base + 2u >= uv_pool.length()) {
+        return false;
+    }
+    const vec2 a = unpackHalf2x16(uv_pool[base]);
+    const vec2 b = unpackHalf2x16(uv_pool[base + 1u]);
+    const vec2 c = unpackHalf2x16(uv_pool[base + 2u]);
+    const vec2 uv = a * (1.0 - barycentrics.x - barycentrics.y) + b * barycentrics.x + c * barycentrics.y;
+    return textureLod(surface_textures[nonuniformEXT(slot)], uv, 0.0).r > 0.5;
+}
+
 float SmokeAlpha(uint instance, uint primitive, vec2 barycentrics) {
     const SurfaceRecord r = surfaces[instance];
     if ((r.flags & SurfaceUsable) != SurfaceUsable || r.texture == 0u ||
@@ -494,7 +533,7 @@ layout(location = 0) rayPayloadInEXT GiPayload payload;
 hitAttributeEXT vec2 attribs;
 void main() {
     const uint instance = uint(gl_InstanceCustomIndexEXT);
-    if ((payload.flags & GiPayloadThroughGlass) != 0u && IsGlassPane(instance)) {
+    if ((payload.flags & GiPayloadThroughGlass) != 0u && GlassAt(instance, uint(gl_PrimitiveID), attribs)) {
         ignoreIntersectionEXT;
     }
     if (!AlphaTestPasses(instance, uint(gl_PrimitiveID), attribs)) {
@@ -664,7 +703,7 @@ float TraceSpan(vec3 origin, vec3 dir, float t_min, float t_max, uint mask, out 
             const uint cand_instance = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(q, false));
             const uint cand_prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(q, false));
             const vec2 cand_bary = rayQueryGetIntersectionBarycentricsEXT(q, false);
-            if (trace_through_glass && IsGlassPane(cand_instance)) {
+            if (trace_through_glass && GlassAt(cand_instance, cand_prim, cand_bary)) {
                 continue;
             }
             if (AlphaTestPasses(cand_instance, cand_prim, cand_bary)) {
@@ -740,7 +779,7 @@ float SegmentTransmittance(vec3 origin, vec3 dir, float t_min, float t_max) {
         const uint instance = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(q, false));
         const uint primitive = uint(rayQueryGetIntersectionPrimitiveIndexEXT(q, false));
         const vec2 b = rayQueryGetIntersectionBarycentricsEXT(q, false);
-        if (IsGlassPane(instance)) {
+        if (GlassAt(instance, primitive, b)) {
             t *= GlassTransmit;
         } else if (instance < surfaces.length() && (surfaces[instance].flags & SurfaceBlended) != 0u) {
             t *= 1.0 - clamp(SmokeAlpha(instance, primitive, b) * SmokeGiOpacity, 0.0, 1.0);
@@ -1007,7 +1046,76 @@ bool DomeSky(vec3 dir, out vec3 radiance) {
 }
 #endif
 
+float FillSkyGain() { return strength_bias.w; }
+
+// The game's directional lights 3 and 4 (half-Lambert squared, unshadowed in the stock shader)
+// are its sky light: on the Cathedral Ward bridge they are as bright as the moon and light the
+// snow from behind the camera, while the painted night dome is nearly black. Path-traced light
+// only (37c9e7c) dropped them, so open ground under a full moon came out ~6x darker than stock.
+// Here they come back as sky radiance on GI misses (world set, rt_world_set.comp), so geometry
+// occludes them. 24/17 makes an unoccluded surface facing the light get the stock value:
+// the cosine-weighted mean of ((1 + mu) / 2)^2 over that hemisphere is 17/24.
+// BB_RT_GI_FILL_SKY scales it (0 = off); the reflection pass passes 0.
+// The primary pixel's own directional set (GBuffer3 alpha), for FillSky; ~0u = none.
+uint fill_set = 0xFFFFFFFFu;
+
+// rt_direct.comp MoonSet: the pixel's own set when its light 1 points where the world set's
+// does, so each material keeps the game's moon colour and it does not follow the camera; else
+// the world set. ~0u when neither is valid.
+uint MoonSet(uint own) {
+    const uint count = DirSetCount();
+    const uint world = WorldSet();
+    const uint w = world != 0u && world <= count ? world - 1u : 0xFFFFFFFFu;
+    if (own >= count) {
+        return w;
+    }
+    if (w == 0xFFFFFFFFu || w == own) {
+        return own;
+    }
+    const vec3 c = sets[own * 18u + 4u].xyz;
+    const vec3 d_own = sets[own * 18u].xyz;
+    const vec3 d_world = sets[w * 18u].xyz;
+    const bool aligned = dot(c, c) > 0.0 && dot(d_own, d_own) > 0.0 && dot(d_world, d_world) > 0.0 &&
+                         dot(normalize(d_own), normalize(d_world)) > 0.9999;
+    return aligned ? own : w;
+}
+
+vec3 FillSky(vec3 dir) {
+    const float gain = FillSkyGain();
+    if (!(gain > 0.0) || (BounceFlags() & BounceFlagDirSets) == 0u) {
+        return vec3(0.0);
+    }
+    const uint set = MoonSet(fill_set);
+    if (set >= DirSetCount()) {
+        return vec3(0.0);
+    }
+    const uint base = set * 18u;
+    const uvec2 extra = floatBitsToUint(sets[base + 16u].xy);
+    vec3 r = vec3(0.0);
+    for (uint k = 0u; k < 2u; ++k) {
+        if ((k == 0u ? extra.x : extra.y) == 0u) {
+            continue;
+        }
+        const vec3 d = sets[base + 2u + k].xyz;
+        if (!(dot(d, d) > 0.0)) {
+            continue;
+        }
+        const vec3 L = normalize(vec3(dot(view_rows[0].xyz, d), dot(view_rows[1].xyz, d),
+                                      dot(view_rows[2].xyz, d)));
+        const float h = 0.5 * dot(dir, L) + 0.5;
+        r += max(sets[base + 6u + k].xyz, vec3(0.0)) * (h * h);
+    }
+    r *= gain * (24.0 / 17.0);
+    return Finite(r) ? r : vec3(0.0);
+}
+
+vec3 SkyLookup(vec3 dir);
+
 vec3 SkyRadiance(vec3 dir) {
+    return SkyLookup(dir) + FillSky(dir);
+}
+
+vec3 SkyLookup(vec3 dir) {
 #ifdef RT_REFLECT
     vec3 dome;
     if (DomeSky(dir, dome)) {
@@ -1267,7 +1375,9 @@ vec3 DirectLit(vec3 p, vec3 n, uint set_id, vec3 v, vec3 albedo, vec4 material, 
         }
     }
     if ((BounceFlags() & BounceFlagDirSets) != 0u && set_id < DirSetCount()) {
-        const uint base = set_id * 18u;
+        // The same set the direct pass shades this pixel with (MoonSet), so bounce light has the
+        // same moon.
+        const uint base = MoonSet(set_id) * 18u;
         const vec4 d1 = sets[base];
         const vec3 c1 = sets[base + 4u].xyz;
         const vec3 L1 = normalize(vec3(dot(view_rows[0].xyz, d1.xyz), dot(view_rows[1].xyz, d1.xyz),
@@ -1367,7 +1477,7 @@ vec3 FibonacciDir(uint i, uint n) {
 float VisSkyTransmittance(vec3 origin, vec3 dir) {
     rayQueryEXT q;
     rayQueryInitializeEXT(q, accelerationStructureEXT(tlas_frame_flags.xy),
-                          gl_RayFlagsTerminateOnFirstHitEXT, 0xEFu & ~MaskSolid, TlasPoint(tlas_frame_flags.xy, origin), 0.0, TlasDir(tlas_frame_flags.xy, dir),
+                          gl_RayFlagsTerminateOnFirstHitEXT, 0x6Fu & ~MaskSolid, TlasPoint(tlas_frame_flags.xy, origin), 0.0, TlasDir(tlas_frame_flags.xy, dir),
                           1e6);
     float t = 1.0;
     while (rayQueryProceedEXT(q)) {
@@ -1548,6 +1658,509 @@ void main() {
         vis_out[o + 2u] = vec4(vis_screen, u.y > 0.0 ? u.x / u.y : 0.0, 0.0);
     }
 }
+#elif defined(RT_SKY_LAYER)
+// The game's moon and cloud layer (BB_RT_MOON_FROM_SKY): a blended band mesh around the camera
+// (pixel shader rt_gi.h SkyLayerPs) that the TLAS holds under its own mask bit. Phase 0 traces
+// it from the camera over a world azimuth x elevation grid and stores premultiplied rgb and
+// coverage; phase 1 (one workgroup) finds the moon disc there and stores its world direction
+// in the moon slot for rt_moon_dir.comp. No look at the sky is needed and nothing on screen
+// (fire, cloud gaps, exposure) can pass for the moon. Hits whose texture is unknown come out
+// magenta in the grid (debug view BB_RT_SKY_DEBUG=4).
+layout(push_constant) uniform SkyLayerPush {
+    uint layer_base; // material slot of grid cell 0 (rt_gi.h SkyLayerSlot)
+    uint moon_slot;  // rt_gi.h MoonDirSlot
+    uint layer_phase;
+    float moon_min;  // weakest-channel score a disc needs
+    // Direction from the camera to the cached moon of this sky model (rt_moon_cache.h; w 1 when
+    // known): the game draws the disc only while it is in view, so a load facing away starts
+    // from the cache.
+    vec4 moon_seed;
+    uint moon_reset; // 1 on the first search after a load: drop the last map's moon
+};
+const uint MaskSky = 0x80u;     // rt_geometry.h MaskSky
+const uint LayerW = 512u;       // rt_gi.h SkyLayerWidth
+const uint LayerH = 128u;       // rt_gi.h SkyLayerHeight
+const float LayerElMin = -20.0; // rt_gi.h SkyLayerElMin, degrees
+const float LayerElMax = 90.0;  // rt_gi.h SkyLayerElMax
+// Searches (rt_gi.h SkyLayerEvery frames apart) the moon is kept once the layer is gone (a load,
+// an interior). While the layer draws, a known moon is kept with no limit: the game draws the
+// disc only while it is in view, so looking at the ground drops it from the layer. w is MoonHold
+// only on the search that found the disc (the CPU caches those, rt_moon_cache.h); a kept or
+// seeded moon has MoonHold - 1.
+const float MoonHold = 150.0;
+const int MoonWindow = 12;      // cells around the peak for the weighted centre (a big moon is ~6 cells in radius)
+// A disc, not a pale cloud: the peak must be MoonContrast x the mean score on a ring about 5
+// degrees out (7 azimuth cells, 6 elevation cells). Clouds are wide, so their ring is as pale.
+const float MoonContrast = 4.0;
+const uint MoonRingTaps = 16u;
+const vec4 LayerUnknown = vec4(1.0, 0.0, 1.0, 0.5);
+
+vec3 LayerDir(vec2 cell) {
+    const float az = radians((cell.x / float(LayerW)) * 360.0 - 180.0);
+    const float el = radians(mix(LayerElMin, LayerElMax, cell.y / float(LayerH)));
+    return vec3(cos(el) * sin(az), sin(el), cos(el) * cos(az));
+}
+
+vec4 LayerTexel(uint instance, uint primitive, vec2 b) {
+    if (instance >= surfaces.length()) {
+        return LayerUnknown;
+    }
+    const SurfaceRecord r = surfaces[instance];
+    const uint base = r.uv_base + primitive * TriangleWords;
+    if ((r.flags & SurfaceUsable) != SurfaceUsable || r.texture == 0u ||
+        r.texture >= MaxSurfaceTextures || base + 2u >= uv_pool.length()) {
+        return LayerUnknown;
+    }
+    const vec2 u0 = unpackHalf2x16(uv_pool[base]);
+    const vec2 u1 = unpackHalf2x16(uv_pool[base + 1u]);
+    const vec2 u2 = unpackHalf2x16(uv_pool[base + 2u]);
+    const vec2 uv = u0 * (1.0 - b.x - b.y) + u1 * b.x + u2 * b.y;
+    const vec4 t = textureLod(surface_textures[nonuniformEXT(r.texture)], uv, 0.0);
+    if (any(isnan(t)) || any(isinf(t))) {
+        return vec4(0.0);
+    }
+    return vec4(max(t.rgb, vec3(0.0)), clamp(t.a, 0.0, 1.0));
+}
+
+// Every layer surface along the ray, composited without order (premultiplied sum, coverage).
+vec4 LayerTrace(vec3 w) {
+    const vec3 v = vec3(dot(view_rows[0].xyz, w), dot(view_rows[1].xyz, w), dot(view_rows[2].xyz, w));
+    if (!Finite(v) || dot(v, v) < 1e-6) {
+        return vec4(0.0);
+    }
+    const vec3 dir = normalize(v);
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q, accelerationStructureEXT(tlas_frame_flags.xy), gl_RayFlagsNoOpaqueEXT,
+                          MaskSky, TlasPoint(tlas_frame_flags.xy, vec3(0.0)), 0.0,
+                          TlasDir(tlas_frame_flags.xy, dir), 1e6);
+    vec3 rgb = vec3(0.0);
+    float clear = 1.0;
+    while (rayQueryProceedEXT(q)) {
+        if (rayQueryGetIntersectionTypeEXT(q, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+            const vec4 c = LayerTexel(uint(rayQueryGetIntersectionInstanceCustomIndexEXT(q, false)),
+                                      uint(rayQueryGetIntersectionPrimitiveIndexEXT(q, false)),
+                                      rayQueryGetIntersectionBarycentricsEXT(q, false));
+            rgb += c.rgb * c.a;
+            clear *= 1.0 - c.a;
+        }
+    }
+    return vec4(rgb, 1.0 - clear);
+}
+
+// Distance from the camera to the first mostly opaque layer texel along world direction w.
+float LayerHitT(vec3 w) {
+    const vec3 v = vec3(dot(view_rows[0].xyz, w), dot(view_rows[1].xyz, w), dot(view_rows[2].xyz, w));
+    if (!Finite(v) || dot(v, v) < 1e-6) {
+        return 0.0;
+    }
+    const vec3 dir = normalize(v);
+    rayQueryEXT q;
+    rayQueryInitializeEXT(q, accelerationStructureEXT(tlas_frame_flags.xy), gl_RayFlagsNoOpaqueEXT,
+                          MaskSky, TlasPoint(tlas_frame_flags.xy, vec3(0.0)), 0.0,
+                          TlasDir(tlas_frame_flags.xy, dir), 1e6);
+    float best = 0.0;
+    while (rayQueryProceedEXT(q)) {
+        if (rayQueryGetIntersectionTypeEXT(q, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+            const vec4 c = LayerTexel(uint(rayQueryGetIntersectionInstanceCustomIndexEXT(q, false)),
+                                      uint(rayQueryGetIntersectionPrimitiveIndexEXT(q, false)),
+                                      rayQueryGetIntersectionBarycentricsEXT(q, false));
+            const float t = rayQueryGetIntersectionTEXT(q, false);
+            if (c.a > 0.5 && min(c.r, min(c.g, c.b)) > moon_min && (best == 0.0 || t < best)) {
+                best = t;
+            }
+        }
+    }
+    return best;
+}
+
+// The moon is near white; the layer's clouds are red or grey. The weakest channel scores it.
+float LayerWhite(uint i) {
+    const uint slot = layer_base + i;
+    if (slot >= material.length()) {
+        return 0.0;
+    }
+    const vec4 m = material[slot];
+    return Finite(m.rgb) ? max(min(m.r, min(m.g, m.b)), 0.0) : 0.0;
+}
+
+shared float l_peak[64];
+shared uint l_at[64];
+shared vec3 l_sum[64];
+shared uint l_cover;
+
+void FindLayerMoon() {
+    const uint t = gl_LocalInvocationIndex;
+    if (t == 0u) {
+        l_cover = 0u;
+    }
+    barrier();
+    float peak = 0.0;
+    uint cover = 0u;
+    uint at = 0u;
+    // Rows above the horizon (y > 0.02, about 1.2 degrees).
+    const uint first = uint(ceil((degrees(asin(0.02)) - LayerElMin) / (LayerElMax - LayerElMin) *
+                                 float(LayerH) - 0.5));
+    for (uint i = t + first * LayerW; i < LayerW * LayerH; i += 64u) {
+        const float s = LayerWhite(i);
+        if (s > peak) {
+            peak = s;
+            at = i;
+        }
+        const uint slot = layer_base + i;
+        cover += slot < material.length() && material[slot].a > 0.01 ? 1u : 0u;
+    }
+    atomicAdd(l_cover, cover);
+    l_peak[t] = peak;
+    l_at[t] = at;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (t < stride && l_peak[t + stride] > l_peak[t]) {
+            l_peak[t] = l_peak[t + stride];
+            l_at[t] = l_at[t + stride];
+        }
+        barrier();
+    }
+    const float top = l_peak[0];
+    const ivec2 c0 = ivec2(l_at[0] % LayerW, l_at[0] / LayerW);
+    // Three rings (about 5, 10 and 17 degrees out); the darkest one counts. Later in the game the
+    // moon grows to ~8 degrees across: the 5 degree ring then lay on the disc and its glow, so the
+    // moon was never found and the light kept a stale cached direction while the player faced it.
+    vec3 ring = vec3(0.0);
+    if (t < MoonRingTaps) {
+        const float a = float(t) * (6.28318530718 / float(MoonRingTaps));
+        const vec2 cs = vec2(cos(a), sin(a));
+        for (int r = 0; r < 3; ++r) {
+            const vec2 radius = r == 0 ? vec2(7.0, 6.0) : r == 1 ? vec2(14.0, 12.0) : vec2(24.0, 20.0);
+            const ivec2 c = c0 + ivec2(round(radius * cs));
+            const int y = clamp(c.y, 0, int(LayerH) - 1);
+            ring[r] = LayerWhite(uint(y) * LayerW + uint((c.x + int(LayerW)) % int(LayerW)));
+        }
+    }
+    l_sum[t] = ring;
+    barrier();
+    vec3 ring_sum = vec3(0.0);
+    for (uint k = 0u; k < MoonRingTaps; ++k) {
+        ring_sum += l_sum[k];
+    }
+    barrier();
+    const float ring_mean = min(ring_sum.x, min(ring_sum.y, ring_sum.z)) / float(MoonRingTaps);
+    const bool found = top > moon_min && top > MoonContrast * ring_mean;
+    vec3 sum = vec3(0.0);
+    if (found) {
+        const int span = 2 * MoonWindow + 1;
+        for (int k = int(t); k < span * span; k += 64) {
+            const ivec2 o = ivec2(k % span, k / span) - MoonWindow;
+            const int y = c0.y + o.y;
+            if (y < 0 || y >= int(LayerH)) {
+                continue;
+            }
+            const int x = (c0.x + o.x + int(LayerW)) % int(LayerW);
+            const float s = LayerWhite(uint(y) * LayerW + uint(x));
+            if (s > 0.5 * top) {
+                sum += LayerDir(vec2(x, y) + 0.5) * (s - 0.5 * top);
+            }
+        }
+    }
+    l_sum[t] = sum;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (t < stride) {
+            l_sum[t] += l_sum[t + stride];
+        }
+        barrier();
+    }
+    if (t != 0u || moon_slot >= material.length()) {
+        return;
+    }
+    const vec3 view_t = vec3(view_rows[0].w, view_rows[1].w, view_rows[2].w);
+    const vec3 cam = -(view_rows[0].xyz * view_t.x + view_rows[1].xyz * view_t.y +
+                       view_rows[2].xyz * view_t.z);
+    // Cells this code wrote carry w = MoonCellTag (grid coverage is at most 1): the old grid
+    // values there passed as a sighting and a position and swung the light 29 degrees.
+    const float MoonCellTag = 4.0;
+    // A camera jump between two searches (a warp, a load) is another map with another moon:
+    // start over (row 0 cell 4: the camera of the last search). The CPU's reset (the layer's
+    // draws came back after a second away: a load, but also a look at the ground or a walk
+    // under a roof) only counts while this run has no moon placed in the world: it dropped the
+    // found moon and the light went back to the cached direction of the cloud draws, which other
+    // maps share (Cathedral Ward: 30 degrees off), until the player looked at the disc again.
+    const float MoonJump = 100.0;
+    const uint own_last = layer_base + 4u;
+    const vec4 last = material[own_last];
+    const bool jumped = last.w == MoonCellTag && Finite(last.xyz) && Finite(cam) &&
+                        distance(last.xyz, cam) > MoonJump;
+    const bool placed = material[layer_base].w == MoonCellTag;
+    // No tagged camera yet: the first search of a session (or of this layout of the cells).
+    const bool reset = jumped || last.w != MoonCellTag || ((moon_reset & 1u) != 0u && !placed);
+    material[own_last] = vec4(cam, MoonCellTag);
+    vec4 m = material[moon_slot];
+    if (!Finite(m.xyz) || !(m.w > 0.0) || reset) {
+        m = vec4(0.0);
+    }
+    const uint stats = layer_base + LayerW * LayerH;
+    // The moon on screen (rt_sky.comp FindScreenMoon, written every frame): the disc the player
+    // sees. It wins over the layer mesh's white spot, which only counts with BB_RT_MOON_LAYER_FIND=1.
+    const vec4 screen = stats + 2u < material.length() ? material[stats + 2u] : vec4(0.0);
+    // The disc's range in metres (rt_sky.comp FindScreenMoon, its stats slot).
+    const float screen_range = stats + 3u < material.length() ? material[stats + 3u].w : 0.0;
+    // Its glow (luminance over the sky's just past it): the moon is the disc with the most.
+    const float screen_glow = stats + 3u < material.length() ? material[stats + 3u].x : 0.0;
+    bool on_screen = screen.w > 0.0 && Finite(screen.xyz) && dot(screen.xyz, screen.xyz) > 0.5;
+    // w -1: the search ran and found no disc.
+    const bool search_ran = on_screen || screen.w < 0.0;
+    if (search_ran) {
+        material[stats + 2u].w = 0.0; // used once
+    }
+    // Finds carry rt_sky.comp ScreenMoonTag: they passed the disc test (a round mesh in front of
+    // the sky, any colour). Untagged finds never count: lit clouds out of view replaced the moon
+    // and the light swung as the player walked. The first disc of a run replaces the kept moon
+    // (the game's or the cache's direction) once it was found MoonFirst times at one spot (row 0
+    // cell 3: the spot, w 10 + the count, then 2 = a disc was seen; reset on load). At once, one
+    // stray find in the Nightmare Frontier, whose sky has no moon, placed a moon behind the
+    // rocks and the whole map sat in its shadow until the next warp.
+    const float MoonFirst = 3.0;
+    const float MoonFirstDir = 0.99863; // cos(3 degrees)
+    const uint own_disc = layer_base + 3u;
+    const bool screen_disc = on_screen && fract(screen.w) > 0.25;
+    const bool disc_seen = !reset && material[own_disc].w == 2.0;
+    bool confirm = false; // this search is the one that makes the first disc count
+    if (screen_disc && !disc_seen) {
+        const vec4 spot = reset ? vec4(0.0) : material[own_disc];
+        const bool same = Finite(spot.xyz) && dot(spot.xyz, spot.xyz) > 0.5 && spot.w >= 10.0 &&
+                          dot(normalize(screen.xyz), spot.xyz) > MoonFirstDir;
+        const float count = same ? spot.w - 10.0 + 1.0 : 1.0;
+        confirm = count >= MoonFirst;
+        material[own_disc] = vec4(normalize(screen.xyz), confirm ? 2.0 : 10.0 + count);
+        if (!confirm) {
+            on_screen = false; // not yet
+        }
+    } else if (reset) {
+        material[own_disc] = vec4(0.0);
+    }
+    if (!screen_disc) {
+        on_screen = false;
+    }
+    const bool layer_find = (moon_reset & 2u) != 0u;
+    const vec3 d = on_screen ? screen.xyz : (layer_find && found ? l_sum[0] : vec3(0.0));
+    const bool seeded = moon_seed.w > 0.0 && Finite(moon_seed.xyz) && dot(moon_seed.xyz, moon_seed.xyz) > 0.5;
+    vec3 found_dir = vec3(0.0);
+    // The disc the game draws is a mesh a few hundred metres out (two sightings 150 m apart at the
+    // cathedral met within 4 m, 250-390 m away), so a kept direction drifted 13 degrees as the
+    // player walked. Each run triangulates the disc from its own sightings, kept in grid row 0
+    // (below the horizon, never searched; phase 0 leaves these cells): cell 0 the position (w 1),
+    // cell 1 the camera of the last sighting (w 1), cell 2 its direction. Out of view the light
+    // points from the camera at that position. A find always wins over the cached seed: cloud
+    // segments are shared between areas, so the seed can be another area's moon (the cathedral
+    // got Hunter's Dream's, 15 degrees off). w = MoonOwn marks a moon found this run.
+    const float MoonOwn = MoonHold - 0.5;
+    const float MoonBaseline = 10.0;      // metres walked between sightings for a triangulation
+    const float MoonMinParallax = 3.0e-4; // sin^2 of 1 degree between the two sightings
+    const uint own_pos = layer_base, own_cam = layer_base + 1u, own_dir = layer_base + 2u;
+    vec4 pos = material[own_pos];
+    vec4 s_cam = material[own_cam];
+    vec4 s_dir = material[own_dir];
+    if (reset || !Finite(pos.xyz) || !Finite(s_cam.xyz) || !Finite(s_dir.xyz) ||
+        !Finite(cam)) {
+        pos = vec4(0.0);
+        s_cam = vec4(0.0);
+        s_dir = vec4(0.0);
+    }
+    pos.w = pos.w == MoonCellTag ? 1.0 : 0.0;
+    s_cam.w = s_cam.w == MoonCellTag ? 1.0 : 0.0;
+    // The first disc of the run, once confirmed, replaces whatever was kept.
+    if (confirm) {
+        pos = vec4(0.0);
+        s_cam = vec4(0.0);
+        s_dir = vec4(0.0);
+        m = vec4(0.0);
+    }
+    const bool own = m.w >= MoonOwn && dot(m.xyz, m.xyz) > 0.5;
+    // Row 0 cell 5: the glow of the kept moon (x) and of the stray spot being counted (y).
+    const uint own_glow = layer_base + 5u;
+    vec2 glow = material[own_glow].w == MoonCellTag && !reset && !confirm
+                    ? material[own_glow].xy : vec2(0.0);
+    if (any(isnan(glow)) || any(isinf(glow))) {
+        glow = vec2(0.0);
+    }
+    bool take = dot(d, d) > 0.0 && Finite(normalize(d)) && normalize(d).y > 0.02;
+    // The moon is static in the world: once this run has one (triangulated, or else the first
+    // find), a find off it is a stray and is dropped. A small bright patch at the horizon in
+    // Hemwick passed as the disc now and then and flicked the light between it and the moon.
+    // Off by MoonAgree from the position (3 degrees), or MoonAgreeDir from a direction-only moon
+    // (10: walking turns the disc until it is triangulated). A spot seen elsewhere steadily
+    // replaces the kept moon, so one wrong first find does not stick for the whole run: s_dir.w
+    // counts sightings of one stray spot (cell 3 xyz, within MoonAgreeDir), less MoonEmptyCost
+    // per search with no disc, and MoonUnlock replaces. A sighting elsewhere restarts it, one of
+    // the kept moon clears it. A plain count let a spot that passed about 1 search in 4 with the
+    // camera still replace the moon after 300 frames; the moon in view passes every search, so
+    // a wrong first find still unlocks in under a second (12 searches, 4 frames apart).
+    const float MoonAgree = 0.99863;    // cos(3 degrees)
+    const float MoonAgreeDir = 0.98481; // cos(10 degrees)
+    const float MoonUnlock = 12.0;
+    const float MoonEmptyCost = 2.0;
+    const float MoonFindBlend = 0.1;
+    if (isnan(s_dir.w) || isinf(s_dir.w)) {
+        s_dir.w = 0.0;
+    }
+    vec3 kept = vec3(0.0);
+    if (pos.w > 0.0 && dot(pos.xyz - cam, pos.xyz - cam) > 1.0) {
+        kept = normalize(pos.xyz - cam);
+    } else if (own) {
+        kept = normalize(m.xyz);
+    }
+    // The kept moon in the middle of the view and not found there: its glow fades, so a kept
+    // disc that is one no longer (the Nightmare Frontier's rock, once the search stopped passing
+    // it) gives way to the next one seen.
+    const float MoonGlowFade = 0.97;
+    const float MoonCentred = 0.96593; // cos(15 degrees) from the view's axis
+    const bool found_kept = take && dot(kept, kept) > 0.5 &&
+                            dot(normalize(d), kept) >= (pos.w > 0.0 ? MoonAgree : MoonAgreeDir);
+    if (search_ran && dot(kept, kept) > 0.5 && !found_kept &&
+        dot(normalize(view_rows[2].xyz), kept) > MoonCentred) {
+        glow.x *= MoonGlowFade;
+    }
+    if (take && dot(kept, kept) > 0.5 &&
+        dot(normalize(d), kept) < (pos.w > 0.0 ? MoonAgree : MoonAgreeDir)) {
+        const vec3 stray = material[own_disc].xyz;
+        const bool same = Finite(stray) && dot(stray, stray) > 0.5 && dot(normalize(d), stray) > MoonAgreeDir;
+        s_dir.w = same ? max(s_dir.w, 0.0) + 1.0 : 1.0;
+        material[own_disc].xyz = normalize(d);
+        // A disc with less glow never replaces the kept one: a moonlit round cloud in the
+        // Hunter's Dream (glow 1.4, the moon 1.6-2.6) took the light for as long as the camera
+        // rested on it. Found first, it still gives way to the moon.
+        glow.y = same && on_screen ? mix(glow.y, screen_glow, 0.25) : screen_glow;
+        if (s_dir.w < MoonUnlock || (on_screen && glow.x > 0.0 && glow.y <= glow.x)) {
+            take = false;
+        } else {
+            glow.x = 0.0;
+            pos = vec4(0.0);
+            s_cam = vec4(0.0);
+            s_dir = vec4(0.0);
+        }
+    } else if (search_ran && !screen_disc) {
+        s_dir.w = max(s_dir.w - MoonEmptyCost, 0.0);
+    }
+    if (take) {
+        found_dir = normalize(d);
+        // Finds on one moon scatter (about 1 degree when the disc is half off screen), so one
+        // that agrees with this run's moon moves it a tenth of the way.
+        if (own && dot(found_dir, normalize(m.xyz)) >= MoonAgreeDir) {
+            found_dir = normalize(mix(normalize(m.xyz), found_dir, MoonFindBlend));
+        }
+        m = vec4(found_dir, MoonHold);
+        s_dir.w = 0.0;
+        if (on_screen) {
+            glow.x = glow.x > 0.0 ? mix(glow.x, screen_glow, 0.1) : screen_glow;
+        }
+        // The disc on screen comes with its range (depth): the moon's place in the world at
+        // once, from one look. Two sightings a walk apart (below) only serve a layer find.
+        const bool ranged = on_screen && screen_range > 50.0 && screen_range < 5.0e4;
+        if (ranged) {
+            // The first find places it; later ones move it a twentieth of the way (finds 4
+            // frames apart: about a second to settle). Finds of one disc scatter 0.4-0.7 degrees
+            // (the blood moon's rims next to a cloud sheet, Upper Cathedral Ward's half disc); at
+            // a quarter of the way the light crept with them.
+            const vec3 x = cam + normalize(d) * screen_range;
+            pos = vec4(pos.w > 0.0 ? mix(pos.xyz, x, 0.05) : x, 1.0);
+            s_cam = vec4(cam, 1.0);
+            s_dir = vec4(found_dir, 0.0);
+        }
+        const vec3 walked = cam - s_cam.xyz;
+        if (!ranged && s_cam.w > 0.0 && dot(walked, walked) > MoonBaseline * MoonBaseline) {
+            // Closest points of the rays s_cam + t0 * d0 and cam + t1 * found_dir.
+            const vec3 d0 = s_dir.xyz;
+            const float k = dot(d0, found_dir);
+            const float den = 1.0 - k * k;
+            if (den > MoonMinParallax) {
+                const vec3 w0 = s_cam.xyz - cam;
+                const float e = dot(d0, w0), f = dot(found_dir, w0);
+                const float t0 = (k * f - e) / den;
+                const float t1 = (f - k * e) / den;
+                const vec3 x0 = s_cam.xyz + d0 * t0, x1 = cam + found_dir * t1;
+                if (t0 > 50.0 && t1 > 50.0 && distance(x0, x1) < 0.05 * t1) {
+                    const vec3 x = 0.5 * (x0 + x1);
+                    pos = vec4(pos.w > 0.0 ? mix(pos.xyz, x, 0.25) : x, 1.0);
+                }
+                s_cam = vec4(cam, 1.0);
+                s_dir = vec4(found_dir, 0.0);
+            } else if (dot(walked, walked) > 16.0 * MoonBaseline * MoonBaseline) {
+                // Under a degree over 40 m: the disc is kilometres out, a direction is enough.
+                pos = vec4(0.0);
+                s_cam = vec4(cam, 1.0);
+                s_dir = vec4(found_dir, 0.0);
+            }
+        } else if (!(s_cam.w > 0.0)) {
+            s_cam = vec4(cam, 1.0);
+            s_dir = vec4(found_dir, 0.0);
+        }
+    } else if (l_cover > 0u) {
+        // The layer still draws (clouds) without the disc: the moon is out of view. Keep this
+        // run's moon, else point at the cached moon of this sky from this camera, or keep the
+        // last find.
+        if (own) {
+            m.w = MoonOwn;
+        } else if (seeded) {
+            m = vec4(normalize(moon_seed.xyz), MoonHold - 1.0);
+        } else if (m.w > 0.0) {
+            m.w = MoonHold - 1.0;
+        }
+    } else if (seeded) {
+        // No layer draw (the view points at the ground): the CPU still seeds this sky's moon
+        // for a while (vk_ray_tracing.cpp MoonSeedHold), so shadows keep their direction.
+        m = own ? vec4(m.xyz, MoonOwn) : vec4(normalize(moon_seed.xyz), MoonHold - 1.0);
+    } else if (own && pos.w > 0.0) {
+        // Placed in the world this run: kept until a load or a jump. Skies with no layer draws
+        // (Cathedral Ward under the blood moon) lost it 150 searches after the disc left the
+        // screen and fell back to the game's direction until the player looked up again.
+        m.w = MoonOwn;
+    } else {
+        m.w = max(m.w - 1.0, 0.0);
+        if (m.w == 0.0) {
+            m = vec4(0.0);
+        }
+    }
+    // With a position the light always points at it, on a find too: the moon stays put.
+    if (m.w > 0.0 && (own || m.w == MoonHold) && pos.w > 0.0) {
+        const vec3 to = pos.xyz - cam;
+        if (dot(to, to) > 1.0 && Finite(normalize(to)) && normalize(to).y > 0.02) {
+            m.xyz = normalize(to);
+        }
+    }
+    material[moon_slot] = m;
+    material[own_pos] = vec4(pos.xyz, pos.w > 0.0 ? MoonCellTag : 0.0);
+    material[own_cam] = vec4(s_cam.xyz, s_cam.w > 0.0 ? MoonCellTag : 0.0);
+    material[own_dir] = s_dir;
+    material[own_glow] = vec4(glow, 0.0, MoonCellTag);
+    if (stats < material.length()) {
+        material[stats] = vec4(top, ring_mean, float(c0.x), float(c0.y));
+    }
+    if (stats + 1u < material.length()) {
+        // The distance the CPU caches the find at: the layer hit, or for the disc on screen the
+        // triangulated distance (ScreenMoonDistance until there is one; no mesh to hit).
+        const float ScreenMoonDistance = 2000.0;
+        const float screen_t = pos.w > 0.0 ? distance(pos.xyz, cam) : ScreenMoonDistance;
+        material[stats + 1u] = vec4(
+            m.w == MoonHold ? (on_screen ? screen_t : LayerHitT(found_dir)) : 0.0, found_dir);
+    }
+}
+
+void main() {
+    if (layer_phase == 1u) {
+        FindLayerMoon();
+        return;
+    }
+    const uvec2 c = gl_GlobalInvocationID.xy;
+    if (c.x >= LayerW || c.y >= LayerH) {
+        return;
+    }
+    if (c.y == 0u && c.x < 6u) {
+        return; // FindLayerMoon's own-moon cells
+    }
+    const uint slot = layer_base + c.y * LayerW + c.x;
+    if (slot < material.length()) {
+        material[slot] = LayerTrace(LayerDir(vec2(c) + 0.5));
+    }
+}
 #elif defined(RT_REFLECT)
 float ReflectStrength() { return strength_bias.x; }
 float ReflectMaxRough() { return strength_bias.z; }
@@ -1598,8 +2211,9 @@ void ReflectKeep(ivec2 pixel) {
 // A glossy pixel is glass when the camera ray through it first hits, at the pixel's depth, an
 // instance drawn by a BB_RT_GLASS_PS shader (SurfaceGlass in its surface record). The pane's own
 // texture (no decals) comes back in pane.
-bool GlassFind(vec3 p, out float t_pane, out Surface pane) {
+bool GlassFind(vec3 p, out float t_pane, out Surface pane, out bool mirror) {
     t_pane = 0.0;
+    mirror = false;
     pane = EmptySurface();
     const float dist = length(p);
     if (dist <= 1e-4) {
@@ -1615,11 +2229,34 @@ bool GlassFind(vec3 p, out float t_pane, out Surface pane) {
     const float t = TraceSpan(vec3(0.0), dir, max(dist - window, 0.0), dist + window,
                               MaskSolid | MaskKept, id, primitive,
                               barycentrics, rotation, rejected);
-    if (t < 0.0 || id >= surfaces.length() || (surfaces[id].flags & SurfaceGlass) == 0u) {
+    if (t < 0.0 || !GlassAt(id, primitive, barycentrics)) {
         return false;
     }
-    t_pane = t;
     pane = HitSurface(id, primitive, barycentrics, rotation);
+    // The gap is measured along the pane normal, so a mirror seen at a slant is still caught.
+    const float cos_view = pane.valid ? abs(dot(pane.normal, dir)) : 1.0;
+    const float t_end = t + GlassBackedGap / max(cos_view, 0.25);
+    float t_back = t + 0.002;
+    for (int k = 0; k < 4; ++k) {
+        uint back_id, back_prim;
+        vec2 back_bary;
+        mat3 back_rot;
+        uint back_rejected = 0u;
+        const float tb = TraceSpan(vec3(0.0), dir, t_back, t_end, MaskSolid | MaskKept,
+                                   back_id, back_prim, back_bary, back_rot, back_rejected);
+        if (tb < 0.0) {
+            break;
+        }
+        // Another draw, opaque, right behind: a backing board. The bottles' own liquid (same
+        // instance, outside the glass mask) does not count.
+        if (back_id != id && !GlassAt(back_id, back_prim, back_bary)) {
+            pane = EmptySurface();
+            mirror = true;
+            return false;
+        }
+        t_back = tb + 0.002;
+    }
+    t_pane = t;
     return true;
 }
 
@@ -2264,7 +2901,11 @@ void main() {
         (glass_push.flags & GlassOn) != 0u && 1.0 - roughness > glass_push.gloss;
     float t_pane = 0.0;
     Surface pane = EmptySurface();
-    const bool glass = glass_candidate && GlassFind(p, t_pane, pane);
+    bool mirror = false;
+    const bool glass = glass_candidate && GlassFind(p, t_pane, pane, mirror);
+    if (mirror) {
+        roughness = 0.0;
+    }
     if (glass && (glass_push.flags & GlassDebugMask) != 0u) {
         GlassPaint(pixel, vec3(4.0, 0.0, 4.0));
         return;
@@ -2287,6 +2928,12 @@ void main() {
         water_hit = 1u;
     }
     const bool water = water_hit >= 2u;
+    // The game's gloss ramps from dry to wet over the puddle's rim: a hard cut at
+    // WaterPuddleGloss drew jagged islands of full mirror (the Hunter's Dream path).
+    const float puddle_edge = glass_push.puddle_edge;
+    const float puddle_w = water_hit == 2u && (BounceFlags() & BounceFlagG1) != 0u && puddle_edge > 0.0
+                               ? smoothstep(WaterPuddleGloss, WaterPuddleGloss + puddle_edge, 1.0 - roughness)
+                               : 1.0;
     // Sheet water is a volume: the floor shows through 1 - path / murk of the way, the rest is
     // the murky body (scattered light), and the surface mirrors only its Fresnel share. Linear
     // like the game's water layer (water colour = clamp(depth x 0.2)): shallow water is clear.
@@ -2339,9 +2986,11 @@ void main() {
         g3 = Finite(g3.rgb) && !isnan(g3.a) ? clamp(g3, vec4(0.0), vec4(1.0)) : vec4(0.0);
     }
     const vec3 f0 = water ? vec3(water_hit == 3u ? glass_push.sheet_f0 : glass_push.water_f0)
+                    : mirror ? vec3(MirrorF0)
                     : (ReflectFlags() & ReflectFlagF0) != 0u ? g3.rgb * g3.rgb
                                                               : vec3(ReflectDielectricF0);
     const uint set_id = uint(g3.a * 255.0);
+    fill_set = set_id;
     const vec3 v = -normalize(p);
     const float n_dot_v = dot(n, v);
     if (n_dot_v <= 1e-4) {
@@ -2432,7 +3081,7 @@ void main() {
         reflection = body_lobe ? vec3(body_weight * (1.0 - clear)) * radiance
                                : fresnel * (weight * ReflectStrength() * (water_hit == 3u ? 1.0 : 1.0 - clear) / (1.0 - p_body)) * radiance;
         // A decal (blood) shows through: no mirror or body over it.
-        reflection *= 1.0 - decal;
+        reflection *= (1.0 - decal) * puddle_w;
     }
     vec3 base = ReflectTarget(pixel);
     float ao = 1.0;
@@ -2446,6 +3095,10 @@ void main() {
         base = Finite(spec_before) ? max(spec_before, vec3(0.0)) : vec3(0.0);
     }
     base *= 1.0 - clamp(glass_push.base_cut, 0.0, 1.0);
+    // The silvering takes the light the mirror reflects: only the rest shows the stock smudges.
+    if (mirror) {
+        base *= 1.0 - MirrorF0;
+    }
     vec3 water_irr = vec3(0.0);
     if (water && ReflectDebug() == 0u) {
         const float c = 1.0 - clamp(n_dot_v, 0.0, 1.0);
@@ -2453,7 +3106,10 @@ void main() {
         // Sheet water lets the floor through with real water's F0 (0.02), not the sheet's
         // brighter mirror F0: at 0.5 the floor went half dark, and dry stones and blood glowed.
         const float t0 = water_hit == 3u ? min(f0.x, WaterRealF0) : f0.x;
-        const float under_f = 1.0 - (t0 + (1.0 - t0) * (c2 * c2 * c));
+        // Wet ground under a puddle is darker than dry (PHOTOREAL 13: 0.5-0.8 x albedo). Kept at
+        // dry brightness, the faint sky reflection lay on it like a milky film.
+        const float wet = water_hit == 2u ? mix(1.0, clamp(glass_push.puddle_wet, 0.0, 1.0), puddle_w) : 1.0;
+        const float under_f = (1.0 - puddle_w * (t0 + (1.0 - t0) * (c2 * c2 * c))) * wet;
         const float under = (water_hit == 3u && glass_push.murk > 0.0 ? clear * under_f : under_f) * mist_t;
         if ((glass_push.flags & GlassIrr) != 0u) {
             const vec3 irr = imageLoad(reflect_irr_out, pixel).rgb;
@@ -2711,6 +3367,7 @@ void Shade(ivec2 pixel, bool trace) {
         primary_albedo = Finite(a) ? clamp(a, vec3(0.0), vec3(1.0)) : vec3(1.0);
     }
     const uint set_id = uint(g3.a * 255.0);
+    fill_set = set_id;
     const vec3 origin = p + n * (Bias() + p.z * 2e-4);
     uint state = Hash(uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + Frame() * 26699u);
     vec3 sum = vec3(0.0);

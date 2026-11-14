@@ -384,8 +384,37 @@ constexpr uint32_t SkyImageSlot(uint32_t records, uint32_t cell) {
     return SkyDomeMapSlot(records) + 1 + cell;
 }
 
-constexpr uint32_t MaterialSlots(uint32_t records) {
+// World direction to the moon (or sun) the sky draws: xyz, w = frames it is kept without
+// being seen again (0 = none). The sky layer pass (rt_gi.comp RT_SKY_LAYER) finds the disc in
+// the layer grid; rt_moon_dir.comp points light 1 of every directional set at it, so the
+// moonlight comes from the moon the sky draws.
+constexpr uint32_t MoonDirSlot(uint32_t records) {
     return SkyImageSlot(records, SkyImageCells);
+}
+
+// The game's moon and cloud layer (a band mesh around the camera, pixel shader SkyLayerPs),
+// traced from the camera over a world azimuth x elevation grid every frame: premultiplied rgb,
+// coverage. It needs no look at the sky: the layer is in the TLAS whenever the game draws it.
+constexpr uint32_t SkyLayerPs = 0x765450dfu;
+constexpr uint32_t SkyLayerWidth = 512;  // azimuth -180..180
+constexpr uint32_t SkyLayerHeight = 128; // elevation SkyLayerElMin..SkyLayerElMax
+constexpr float SkyLayerElMin = -20.0f;
+constexpr float SkyLayerElMax = 90.0f;
+constexpr uint32_t SkyLayerCells = SkyLayerWidth * SkyLayerHeight;
+// The pass runs every SkyLayerEvery frames (~0.2 ms each time): the moon and clouds move slowly.
+constexpr uint32_t SkyLayerEvery = 4;
+// rt_gi.comp MoonHold: the moon slot w on the search that found the disc.
+constexpr float MoonHoldSearches = 150.0f;
+
+constexpr uint32_t SkyLayerSlot(uint32_t records, uint32_t cell) {
+    return MoonDirSlot(records) + 1 + cell;
+}
+
+// Two slots after the grid: the moon search's peak score, ring mean score, peak cell x, y; then
+// the found disc's distance from the camera along its direction (0 without a hit); then the
+// brightest cell by luminance (rgba, then cell x, y, luminance).
+constexpr uint32_t MaterialSlots(uint32_t records) {
+    return SkyLayerSlot(records, SkyLayerCells) + 4;
 }
 
 // Pixel shader of the game's sky dome draw; its image 0 is the dome panorama.

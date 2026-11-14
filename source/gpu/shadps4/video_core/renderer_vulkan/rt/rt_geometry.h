@@ -73,6 +73,9 @@ constexpr uint32_t MaskKept = 0x04;
 // to it (rt_direct.comp / rt_gi.comp Transmittance), instead of a closest-hit search.
 constexpr uint32_t MaskPortal = 0x08;
 constexpr uint32_t MaskWater = 0x10;
+// The game's moon and cloud layer (rt_gi.h SkyLayerPs): only the sky layer pass traces it.
+// Every other ray mask leaves this bit out (0x6F / 0x7F in the shaders).
+constexpr uint32_t MaskSky = 0x80;
 
 struct DrawTag {
     uint64_t ps{}, vs{};
@@ -81,6 +84,8 @@ struct DrawTag {
     uint32_t zfunc{}, zwrite{}, ztest{}, stencil{};
     uint32_t prim{}, caster{};
     uint32_t draw{};
+    // The draw's cull mode (bit 0 front, bit 1 back; 0 = double-sided).
+    uint32_t cull{};
 };
 
 constexpr uint8_t InstanceState(bool alpha_test, bool textured, uint32_t mask) {

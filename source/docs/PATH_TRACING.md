@@ -245,6 +245,11 @@ Ghidra project, so:
 | `BB_RT_SPP` | `1` | Bounce rays per pixel per frame (1..16). |
 | `BB_RT_GI_STRENGTH` | `1` | Multiplier of the indirect term added to the scene colour. |
 | `BB_RT_SKY` | `0` | Radiance (grey, linear HDR) for misses, off-screen and occluded hits. |
+| `BB_RT_MOON_FROM_SKY` | `1` | Live. Moonlight comes from the moon the sky draws, not the game's light 1 direction (Cathedral Ward lights the bridge from behind the camera while the moon hangs in front). The game draws the moon and its red clouds as one blended band mesh around the camera (ps `765450df`); that mesh is in the TLAS under its own mask bit (`MaskSky` 0x80, every other ray leaves it out) and the sky layer pass (`rt_gi.comp` `RT_SKY_LAYER`, every 4th frame, cost within noise) traces it from the camera over a 512x128 world azimuth x elevation grid (-20..90 degrees), then takes the whitest spot above the horizon, scored by min(r, g, b) of the texture, as the moon when it is a disc: at least 4x the mean score on a ring about 5 degrees out (a pale cloud is wide, so its ring is as pale; at dusk in the open fields the layer has clouds only, peak 0.04, and a cloud picked by the plain peak pointed the moonlight away and left the view black). `rt_moon_dir.comp` points light 1 of every set in the per-frame set copy at it, so direct, GI, reflections and fog agree. Nothing on screen (fire, cloud gaps, exposure) can pass for the moon. The game draws the moon disc (a 96-index draw of the same model) only while it is in view, while the 5 cloud segments draw every frame: once found, the moon is kept as long as the layer draws, and out of view it comes from the moon cache (`BB_RT_MOON_CACHE`), so a load facing away is lit from the moon without a look at the sky. Without the layer for 600 frames (an interior, a sky with no moon) and with 0, the game's direction. `BB_RT_SKY_DEBUG=4` shows the grid as a strip along the top and the layer over the sky; every sky debug view draws a magenta ring around the moon; the strip's top rows show the moon slot (red held, blue empty), the peak score (green) and 4x the ring mean (yellow), full width 2.0. |
+| `BB_RT_MOON_CACHE` | `rt_moon.txt` | Load time. The moon of each sky model, one `key x y z` line per sky: the key hashes the index and vertex counts of the cloud segments (every layer draw present in each frame since the layer appeared, so the moon draw itself is left out), and x y z is the moon's world position. The moon is a mesh fixed in the world about 756 m out (Hemwick graveyard), not at infinity: across one map its direction moves several degrees, so the light points from the camera at the cached position. A find confirmed by two searches within 1 degree stores the camera plus the disc's distance along its direction, rewritten only when it moves over 20 m (about 1.5 degrees; the hit lands off the disc centre). The log line `moon of sky ... found N degrees from its cached position` gives the seed error at the first find of each run (0.43 measured away from where it was cached). A real look only refreshes the cache. |
+| `BB_RT_SKY_CACHE` | `rt_sky` | Load time. A folder with the learned sky image (the 1024x1024 octahedral image mirrors read, clouds included) per sky model, `<key>.bin`, same key as the moon cache. The image only holds directions that were on screen, so a fresh load had grey dome in mirrors and GI wherever the player had not looked. When a sky appears its file is copied over the image (no file: the image is cleared, so the last sky does not linger); every 240 frames the image is read back and saved once it grew by 0.5 %. RGB9E5 per cell, unseen runs as counts: 1.1 MB for a quarter of the image (Hemwick), 2-8 ms per save on the render thread while the sky is still filling, then none. GI probe cells off screen take the image mean (16 directions, at least half seen) before dome x gain. Measured: a cold load with the cache has the red clouds in the puddles; without it, the grey dome. A fit of the layer texture against the screen sky (gain x dome x (1 - coverage) + gain x layer) was tried first and dropped: error 8.6 vs 5.7 for the dome alone, and yellow-green clouds, because the layer shader recolours its texture with per-draw constants and vertex colours. |
+| `BB_RT_MOON_MIN` | `0.2` | Live. The min(r, g, b) score a layer texel needs to count as the moon. |
+| `BB_RT_GI_FILL_SKY` | `1` | Live. The world set's fill lights 3 and 4 (the game's sky light) added as sky radiance on GI misses, `((1 + dir.L) / 2)^2 * colour * 24/17`, so open ground gets them and geometry occludes them. 0 = off. |
 | `BB_RT_GI_HISTORY` | `16` | Maximum accumulated sample count (temporal weight floor `1/17`). |
 | `BB_RT_GI_CLAMP` | `4` | Radiance clamp per hit (fireflies). |
 | `BB_RT_GI_BIAS` | `0.02` | Ray origin offset along the normal, view units. |
@@ -3911,6 +3916,15 @@ open sewer, A/B/A (`BB_RT_SKY_PS=0` restores the old TLAS): mean RGB 3.90 4.00 6
 3.36 4.18 / 3.88 3.96 6.29, the water reflecting the blue sky. `BB_RT_SKIP_PS` is not the
 tool for this: it stops the draw itself, which also stops the sky pass.
 
+The moon and cloud layer (`765450df`) now gets mask `MaskSky` instead of 0 (see
+`BB_RT_MOON_FROM_SKY`). In the open world it was never in the TLAS at all: it is not a smoke
+draw, so it got no position store, and it draws after the TLAS build, so its held-over draw lost
+its texture. It now stores positions like a water sheet, and a held draw of this shader keeps its
+albedo texture for the replay (other late draws are unchanged). The screen-based moon search it
+replaces (`rt_sky.comp` phase 3, min(r, g, b) of the learned sky image) needed the moon on screen
+once and flipped to the fire core in Central Yharnam or a cloud gap whenever the moon left the
+screen, so the moonlight changed direction until the player looked up again.
+
 Measured at the torch spot (reflect pass GPU ms, 60-frame averages):
 
 | Setup | Reflect pass |
@@ -4010,6 +4024,29 @@ Steady flicker, take two: the wall lamp's swing read too small, and at 0.9 (line
 went down to the 0.25 clamp and read as the lamp going out. Now the scale is
 exp(`BB_RT_EMITTER_STEADY_FLICKER` x noise), default 0.35 (x0.70-x1.42, dips as gentle as
 flares), and FlameNoise is slower (0.25-1.6 Hz), which the accumulated GI follows better.
+
+### Workshop fireplace and candelabra flicker (2026-11-09)
+
+User: the fireplace, candles and outdoor fire lacked the stock "glimmer and wobble".
+- Measured with `tools/live_vision.py` (live DXGI capture, per-region luma sd and optical flow),
+  RT vs F9 stock: mantel 0.8% vs 3.7%, floor 1.8% vs 3.9%.
+- Per-frame light log (`BB_RT_DIRECT_LIST_LOG=2`): the game draws each light once a frame.
+  Candelabra lights (DPointLight5, r 6) are constant. The fireplace (LegacyDPointLightShadowed1,
+  r 3.75) sits at sum 2.000 and swells to 2.175 over ~20 frames every ~1.7 s (0.6 Hz, the stock
+  surfaces' main frequency). That swell gave it `FlickerState::dev` 0.015, over the 0.01 steady
+  threshold, so the fireplace, the biggest flame in the room, got no FlameNoise. Every candle got
+  ~15%.
+- Fix: the steady threshold is now `BB_RT_EMITTER_STEADY_DEV` 0.05 (game-flickered flames sit at
+  0.06+). RT-only A/B, interleaved: hearth 0.7-0.9% (old) -> 3.6-6.9% (new), mantel 1.2 -> 2.5-3.9%.
+  Stock is hearth 3.1%, mantel 2.6%, so this is a little above stock (LOOK: more dramatic).
+- Sway: fixed flames (candles, candelabra, fireplace) now sway by `BB_RT_FIXED_SWAY`; carried
+  flames keep the radius-scaled `BB_RT_EMITTER_SWAY`. Optical-flow motion, px/frame (floor /
+  cabinet shadows): 0 m 0.023 / 0.016 (noise floor; stock 0.015-0.022), 0.015 m 0.024-0.027 /
+  0.019-0.020, 0.05 m 0.043-0.045 / 0.031-0.032. The user called 0.05 "too much wobble for an
+  inside and small fires". An indoor flame's light centre moves about 1 cm, so the default is
+  0.015.
+- RT capture runs at 11 fps (the copy waits behind the RT GPU work; the winrt backend gives the
+  same), so its sd and p2p are valid but Hz above ~5 are not.
 
 ### Lamp halo (2026-11-08)
 
@@ -4168,3 +4205,586 @@ stock depth test (`PackStockDepth` skips lamps). The lamp test was enclosure onl
   rule (needs a restart because the latch is sticky).
 - Test: `tests/test_rt_lights.cpp` `TestFillVis` (fire pit 57.8% / 27.3% up is not a lamp,
   capped 65% / 80% is).
+
+## Facing the moon: lily field brightness and eye adaptation (2026-11-09)
+
+User report: in Hemwick's lily field, looking toward the moon, the image was far darker than
+stock (lower-half screen luma, same view: RT 12.1, stock 53.3). Three causes:
+
+- **ReSTIR GI lost energy.** The spatial pass zeroed the reservoir when the winning
+  neighbour sample was blocked from this pixel. It now keeps the pixel's own reservoir
+  (`rt_restir_gi.comp`), which gives back about a quarter of the GI in the field.
+- **Lilies lost their translucency.** 79b602e dropped the wrap term with the fake rim and
+  ambient. It is back for thin translucent materials only (g1.y > 0: `(nl + w) / (2w + 1)`,
+  w = 10 g1.y), not as a general wrap. `MoonVisibility` flips the ray to the back face for those
+  materials when the moon is behind them. Everything else stays plain Lambert.
+- **Backlit by design.** The moon is behind the field's big tree (canopy blocker at 44 m),
+  so the field is in real shadow. Stock is bright there because of its camera-side ambient and
+  fill, which the no-fake-light rule removed.
+
+Remedy (user choice): **eye adaptation**, `rt_exposure.comp`. It runs after the fog at the post
+trigger, on the HDR scene colour before the game's bloom and tonemap.
+
+- It measures the log-average luminance of a 64x36 grid of non-sky pixels.
+- It moves the boost toward `key - mean` by `BB_RT_EXPOSURE_RATE` per frame (about 0.4 s at
+  80 FPS).
+- The boost never goes below 0 and never above `BB_RT_EXPOSURE_MAX` stops.
+- The gain applies to geometry only. The sky keeps the game's look: a full-frame gain blew the
+  sky and the distant fog to white.
+- Highlights roll off: the gain is `g / (1 + (g - 1) L / W)` for L below a white level W
+  (`BB_RT_EXPOSURE_WHITE` stops above the key), with no change above W. The curve is monotonic
+  and continuous at W.
+- No light is added.
+- With F9 (stock) it only measures. The log line every 120 frames prints both values, which is
+  how the key was set: stock reads -5.2 to -5.6 log2 at the spawn gate and in the field.
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `BB_RT_EXPOSURE` | `1` | Live. `0` turns the eye adaptation off (resets it). |
+| `BB_RT_EXPOSURE_KEY` | `-5.5` | Live. Target log2 luminance of the lit geometry (stock's measure). |
+| `BB_RT_EXPOSURE_MAX` | `1.5` | Live. Largest boost in stops. |
+| `BB_RT_EXPOSURE_RATE` | `0.03` | Live. Share of the gap closed per frame. |
+| `BB_RT_EXPOSURE_WHITE` | `3` | Live. Stops above the key where the boost has faded out. |
+
+Measured live, lower-half screen luma, same view, one boot:
+
+| Spot | Exposure off | Exposure on | Stock (F9) |
+|---|---|---|---|
+| Hemwick spawn gate | 27.6 | 38.9 | 45.4 |
+| Lily field toward the moon | 26.0 | 39.6 | 44.6 |
+
+The boost sits at the +1.5 EV cap in both views. The field stays a little darker than stock
+because it is backlit. The on-screen FPS was the same with the pass on and off (83.9 / 84.2).
+
+### Thin cards pass moonlight through (2026-11-09, `BB_RT_THIN_TRANSMIT`)
+
+User report: still dark facing the moon. `BB_RT_DIRECT_DEBUG=11` (new; needs `BB_RT_RESTIR=0`
+like the other direct views) colours the moon term per pixel: green lit, cyan lit through a thin
+card, black shadowed, blue faces away, dark red no moon term. The field was almost all blue.
+Nothing lost its shadow test: the visible side of every petal faces away from the moon, and the
+game's own directional diffuse is zero there too. Stock is bright only from its fill and ambient.
+
+Real petals and leaves are thin sheets that pass part of the light through, so a backlit field
+glows. A pixel counts as a thin card when:
+
+- the camera ray to its G-buffer point (rt_gi.comp GlassFind's confirm window) lands on an
+  alpha-tested surface, or on the **back face** of an opaque one. A closed solid never shows the
+  camera a back face. The near lilies are opaque double-sided petals (ps bb10e440, seen from the
+  back face), the far ones are alpha-tested cards (ps dbeccd9c);
+- it is not blended, and its spec colour is below 0.1, so iron stays solid.
+
+Moonlight from behind (n.L < 0) then lights it with `-n.L * BB_RT_THIN_TRANSMIT`. The moon
+shadow ray starts from the back side, like the g1.y wrap materials. One camera ray per pixel,
+only where the moon is behind the surface; the answer is cached for the pixel.
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `BB_RT_THIN_TRANSMIT` | `0.4` | Live. Share of the moonlight a thin card passes; `0` off. |
+
+Measured live, lily field facing the full moon, lower-half screen luma, same view, alternated
+twice:
+
+| Transmit 0 | Transmit 0.4 | Stock (F9) |
+|---|---|---|
+| 33.4 / 33.0 | 40.9 / 41.9 | 69.9 |
+
+GPU direct pass: 1.66 ms (1.7 to 1.9 ms before, other views). Debug 11 shows the field cyan and
+the stone pillars blue, so no solid geometry was taken for a card. The exposure boost now sits at
++0.5 EV here, under its cap: the key (-5.5) is the limit. Stock measures -4.5 in this view, 1 EV
+brighter than at the spawn gate where the key was set.
+
+Second report: "I moved the camera and it is black again", same spot. Debug 11 painted the
+whole field black (shadowed), not blue. The moon direction did not move: `BB_RT_PICK` read the
+same view direction to the moon at every pixel. With the moon low, a petal's moon ray crosses
+the flower bed and hits the next petal 0.5 m away (blocker: instance 36, alpha-tested ps
+dbeccd9c). The petals shaded each other like stone.
+
+`ThinMoonVisibility`: within `ThinNear` (1.5 m) of the surface, a thin card on the moon ray
+(alpha-tested, or an opaque sheet hit on its back face) passes `BB_RT_THIN_TRANSMIT` of the light
+instead of blocking it. Past 1.5 m every blocker is solid as before, so tree canopies and walls
+keep their shadows. The near segment runs with every geometry non-opaque (`gl_RayFlagsNoOpaqueEXT`)
+so OMM-opaque petal parts reach the loop. Off with `BB_RT_THIN_TRANSMIT=0` and in rooms with
+portals.
+
+| View | Before | Transmit 0 | Transmit 0.4 |
+|---|---|---|---|
+| Field, moon at the top edge (lower-half luma) | 14.1 | 33.4 / 39.9 | 41.8 / 42.2 |
+
+GPU direct pass: 1.66 -> 2.79 ms in this view (the near segment's non-opaque traversal).
+
+### Kept instances keep their tag; the moon does not creep (2026-11-09)
+
+Third report: "black again" after turning. A kept off-screen instance takes its TLAS mask from
+`entry_tags`, and that was only recorded with `BB_RT_PICK` on. The moon mesh (SkyLayerPs, 32
+triangles about 750 m out, drawn only while in view) stayed in the TLAS as a solid card in front of
+the moon once the camera turned: every moon ray stopped on it (pick sweep: blocker at 740 m, mode 2
+= kept) and whole fields went black. Mist, water sheets, panes and portals lost their masks the
+same way. `entry_tags` is now always recorded; the sweep finds no 740 m blocker.
+
+Fourth report: "when I started moving, the shadows started changing, like trying to get the real
+one". All of it was the cached moon position moving, so the light turned:
+
+- Each find lands up to a grid cell (~25 m at 750 m) off the disc centre, and from one spot every
+  find lands off the same way (~10 m). The cache took the newest find, then a running mean capped
+  at 64 finds; both followed the player, the mean in 2 m steps (1 degree) while standing still.
+  `MoonCache` now keeps the plain mean of all finds (`MaxSamples` = `MaxVotes` 1000).
+- Strays: from one spot the search kept finding a point 52 m (4 degrees) off, and from the spawn a
+  point 123 degrees off at the horizon (~1750 m out), which the old "farther than 100 m is another
+  moon" rule took as the moon and lit the field from. A find farther than `Gate` (30 m) from the
+  moon goes to one candidate cluster instead; the candidate replaces the moon only when it has more
+  votes. Votes are saved as a fifth column in the moon file (a line without them counts 8).
+- The shader lit from the find when it disagreed with the cache by over 3 degrees, so strays lit
+  the frame directly. With a cached moon the light now always follows it (`MoonSeedAgree` removed);
+  finds only feed the cache.
+
+Live (view11, user walking the field): the cached moon stayed within +-2 m (0.15 degrees) of
+(-203 256 637) and the horizon stray at the spawn was outvoted 22 to 1. User: "seems good now,
+none shadow flickering and light changing".
+
+The mesh is fixed in the world, not on a camera-centred dome: with the camera logged per find
+(`cached at ... camera ... direction` line), 70 m of camera movement left the finds within about
++-12 m of (-203 255 637) while the direction changed 4 degrees.
+
+## Maximizing the window lost the device inside DLSS (2026-11-09)
+
+Maximize/restore lost the GPU (checkpoint inside DLSS/NGX) on the 3rd resize of view13, and once
+after 20 min on view12 when the user maximized. A resize recreates the swapchain on the present
+thread, and `Swapchain::Destroy` calls `vkDeviceWaitIdle`, which needs every queue externally
+synchronized, while the render thread kept submitting. The resize, acquire-failure and HDR
+recreates now hold `Scheduler::submit_mutex` (the present-failure path already did). view14: 8
+maximize/restore cycles (16 resizes), no device loss.
+
+## Hunter's Dream look check at player distance (2026-11-09)
+
+A free-camera walk of the isle (house front, graves, gate) against F9 stock, interleaved live
+A/B with `tools/look_ab.ps1`. No knob change: every candidate failed the data.
+- House front, dark next to the fire: the gap to stock (mid 25 vs 48) is the cool designer fills
+  the fill gate removes (`BB_RT_FILL_VIS=0`: top 10% 86 -> 128, tint neutral). They are fake
+  light and stay off. The fire lights stay on (emitter, applied 1.00). `BB_RT_EMITTER_SOURCE`
+  0.25 + range 1.58 (the game curve at 4 m) moved mid by +2, inside noise. The fire cycle moves
+  the area 15-25 luma over minutes; in its bright phase it is in the LOOK bands (top 10% 105-122,
+  p20 15-19, p90/p20 about 6).
+- Graves, open ground: p5 9-10 vs stock 21, but the `mask` shows the floor is canopy and trunks
+  backlit by the sky; the moon shadow on the ground keeps detail. `BB_RT_GI_FILL_SKY` 1.5 / 2
+  did not move p5 (adaptation pulls p90 down instead). Tint neutral (a -4, b -1).
+- Edge mist: luma 75 vs stock 73, same tint; with `BB_RT_FX_FOG=0` it is 83.
+- Workshop interior (player inside, fly camera at the altar, candelabras, desk lantern,
+  workbench): the warmest and most dramatic area. Candles light the altar, curtains and statue
+  under a moon shaft where stock is flat; contact shadows and near-white flame cores hold. Mean
+  34-68 vs stock 23-54, top 10% b +25..+48 (lamp-lit, allowed). The deep shelf cavities under
+  luma 6 are crushed in stock too. The white blob at the high window is the game's shaft sprite,
+  same in stock. Open: the player's pale coat reads khaki; stock keeps it pale with its
+  camera-fixed player light (`BB_RT_FILL_LIGHT`, off as fake light).
+- Workshop wardrobe glass (user request): the wardrobe and desk-cabinet door panes are ps
+  `ca7226ec` (pick: 85-triangle mesh, front and back faces 2 cm apart, gloss 0.75, cabinet back
+  0.9 m behind). Added to the `BB_RT_GLASS_PS` default (`1c3953c6,ca7226ec`). With
+  `BB_RT_GLASS_DEBUG=1` a turn of the workshop accepted only those panes. Live: the closed door
+  shows the bottles inside with the pane's crack decal over them; the open door shows the room.
+  Not yet checked in other areas (the 2000-triangle and gloss guards still apply).
+
+## Workshop bottles: masked glass (2026-11-09)
+
+The workshop bottles and jars are one 29352-triangle mesh of the glass shader ca7226ec, so
+`BB_RT_GLASS_MAX_TRIS` (2000) kept them opaque. The mesh also holds metal parts (rings, caps,
+pipes, nuts) that share its 1024x1024 BC1 atlas, so the whole mesh cannot be glass.
+
+- **Masked glass:** a `BB_RT_GLASS_PS` draw over the triangle cap whose albedo has a mask file
+  `<dir of BB_RT_CFG>/glass_masks/<XXH3 of the guest texture, 16 hex>.pgm` (P5, 8 bit, any size)
+  is glass only where the mask is white. `RayTracing::GlassMaskSlots` uploads the mask as an R8
+  texture, registers it as a surface slot and stores the slot as `-alpha_ref` (only on
+  non-alpha-tested draws). The instance is non-opaque. `GlassAt(instance, primitive, bary)`
+  in rt_gi, rt_direct and rt_restir_gi replaces the instance-only glass tests (any-hit,
+  TraceSpan, transmittance, GlassFind, ThinMoonVisibility, BlockedSpan).
+- **Tools:** `BB_RT_GLASS_MASK_DUMP=1` writes each candidate albedo (mip 0) to
+  `glass_masks/dump/<hash>_<w>x<h>_<vk format>.raw`. `tools/glass_mask.py decode` turns it into a
+  PNG, and `pgm` turns a painted PNG into the mask. Any rt.cfg change rescans; an edited mask file
+  is uploaded again.
+- **The mask** (`data/glass_masks`, copy into `rt-live/glass_masks`) has 10 bottle-body panels of
+  atlas 9ba439fe72338d96. The streaming low-res copy 69623b0bcd1a30f5 gets the same file. Atlas
+  pixel boxes: 620,190-820,352; 822,186-1022,348; 846,358-1022,472; 0,512-284,742;
+  370,403-672,618; 0,742-206,904; 207,742-407,904; 536,743-822,988; 488,643-664,730;
+  0,425-120,507. In each box only the largest non-background part counts. Rows darker than 0.6x
+  the panel median are the liquid band and stay opaque. Then a 3 px erode. 29% of the atlas is
+  glass.
+- **Found by probe:** with `BB_RT_GLASS_DEBUG=1`, masking one atlas box at a time and counting
+  magenta pixels showed which boxes cover the shelf jugs and floor bottles. The top-left strips
+  are the jug necks and handles, and the octagons are the bases: they stay opaque.
+- **Live:** the big jars show the shelf posts behind them, and light passes through the bottles
+  onto the wall. Necks, caps and the liquid stay solid. 61 -> 60 fps.
+- **Not shipped yet:** the launcher sets no `BB_RT_CFG`, so a deployed build needs the mask folder
+  and a path to it.
+
+### Altar cloth was taken for glass (2026-11-09)
+
+The red cloth on the workshop altar looked washed out and see-through. A/B: unchanged without
+the bottle mask and with `BB_RT_GLASS_PASS=0`, right with `BB_RT_GLASS=0` or with
+`BB_RT_GLASS_PS=ca7226ec`. Pick: a 110-triangle alpha-tested mesh of ps 1c3953c6 (the shader of
+the cracked door panes, 28-48 triangles), gloss 0.88, so the reflection pass accepted it as a pane.
+`BB_RT_GLASS_PS` entries now take their own triangle cap (`hash:cap`); the default is
+`1c3953c6:64,ca7226ec`. Live: the cloth matches glass-off, the pick reports "rejected".
+
+### Workshop mirror was taken for glass (2026-11-09)
+
+The standing mirror in the workshop turned into clear glass. Pick: ps ca7226ec, 8 triangles,
+gloss 0.98, with its solid backing board (bb10e440) 4.1 cm behind. `GlassFind` (rt_gi.comp) now
+traces on past an accepted pane: an opaque hit from **another draw** within 5 cm behind it (the
+gap is measured along the pane normal, so a slanted view still catches it) makes it a backed
+mirror, not glass. The bottles' own liquid (the same draw, outside the mask) does not count.
+Small `BB_RT_GLASS_PS` draws can also carry a texture mask now (`GlassMaskSlots` no longer skips
+draws under the triangle cap). Live with `BB_RT_GLASS_DEBUG=1`: the mirror is no longer magenta and
+reflects the room again; the wardrobe panes and the bottles are still glass.
+
+The mirror then went through the plain reflection path: the game's low spec colour as F0, so the
+stock smudge texture dominated and it read as a dull diffuse board. A backed pane is now shaded
+as silvered glass: roughness 0, F0 0.7 (`MirrorF0`, an aged silver mirror; fresh is ~0.9), and
+the stock base is cut to the 30% the silvering leaves, which keeps the stock cracks over the
+reflection. Live: the player and the room show sharp in it; stock shows a near-black pane.
+
+## Messengers' bath lit again; magic may keep its light (2026-11-09)
+
+User: the messengers in the Hunter's Dream bath were too dark (stock: pale, self-lit). Their light
+is a cool-white 2 m point light over the bath (`LegacyDPointLight*` at world (-7.87 0.53 -4.35),
+colour 0.63-1.20 x (1, 1, 1.32), breathing on a ~1 s cycle). The pulse latched it as an emitter,
+but since 2c93dda ("loot is not fire") only flame-coloured lights count as emitters, so the fill
+gate faded it to 0. A light whose colour pulses (`BB_RT_FILL_FLICKER`, 6 reversals) now latches
+`pulse`, and a pulsing light that is not a flame keeps the game's light as is, like the loot
+wisp light. Flames still take the emitter falloff.
+
+New user rule (render-look skill): light from something magical and not real (this bath, arcane
+and insight glows) may stay "fake", with no physical fixture. Live (view25): `flickers ... emitter`
+at frame 3993, the light runs at the game's colour, the messengers and the flowers around the
+bath are lit pale blue-white as in stock.
+
+## A brighter fire reaches further (2026-11-09, `BB_RT_EMITTER_BRIGHT`)
+
+User, at the burning Hunter's Dream house: "its a giant firing thing, but the surrounds doesnt get
+the light". The house fires are game lights of r 7.5 with colour up to 12.8 (a lantern is 2.0),
+and the emitter reach was `BB_RT_EMITTER_RANGE` 1.26 x the game radius whatever the intensity:
+9.5 m, cut while still bright. With inverse-square light and one cut-off level the reach grows
+with sqrt(intensity), so an emitter (not a lamp, not a candle) now gets reach x
+sqrt(max channel / `BB_RT_EMITTER_BRIGHT`), default 2.0 (0 = off). Such a light (`Light::wide`)
+also skips the stock depth-bounds test, which would clip it back to the game's sphere, as lamps do.
+Live (view26): house fires reach 22.8-25.6 m; lanterns/torches (colour <= 2) unchanged. A/B on, off,
+on at the burning side wall: lower half mean 67.2 / 50.2 / 67.4, red minus blue 44 / 15 / 44: the
+flowers, ground and player take the fire's light, the gravestone ~10 m out too. 68 -> 64 FPS.
+
+### The big fire dances, a bit brighter (2026-11-09)
+
+User: "the fire is good, but theres not woobling why, its a giant fire", then "maybe a little more
+bright from the fire". The game keeps the burning house's lights constant (6.4 / 12.8 every
+frame), so their only motion was the steady-flame noise sized for candles (0.25-1.6 Hz swells)
+and the fixed 1.5 cm sway. For an emitter brighter than a lantern (grow = sqrt(colour /
+`BB_RT_EMITTER_BRIGHT`) > 1, computed once from the game colour, also used for the reach):
+- sway `BB_RT_FIXED_SWAY` + `BB_RT_EMITTER_SWAY` x (grow - 1): house ~0.25 m, candles unchanged;
+- steady flicker x grow^`BB_RT_EMITTER_BIG_FLICKER` (0.5), plus a faster octave of the same noise
+  at 3x the rate (~0.75-5 Hz) weighted `BB_RT_EMITTER_BIG_FAST` (0.5);
+- brightness x `BB_RT_EMITTER_BIG_GAIN` (1.5). All three are live knobs.
+Live (view28), interleaved old (all off) / new x2 from the per-frame light log of the three house
+fires: frame-to-frame change rms 1.26 / 2.96 / 1.18 / 3.13 %, mean lum 28.7 / 45.2 / 29.0 / 43.8.
+Screen measures near the player (15 m out) stayed inside the adaptation drift. The sway amplitude
+is not logged (the dlist prints the track position before the sway).
+
+## Warm rule takes the lamp hue only (2026-11-10, `BB_RT_FILL_WARM_HUE`)
+
+The grave enclosure under the big tree in the burning Hunter's Dream had a warm light on the
+player and the flowers with no source in sight. It was `LegacyDPointLight` at world 11.02
+-4.93 -19.38, game colour `2.000 1.243 0.352`, radius 5: emissive 0%, enclosed 0%, no
+flicker, nearest solid 0.67-2.05 m. Only the warm rule (`Rt::WarmEmitter`, "Warm lights are
+lamps" above) kept it. Sky fraction (0.39-0.88) and nearest solid both moved with what the TLAS
+held, so neither split it from the sewer lamps. The colour does: the Dream's designer key
+fills are a saturated amber (`2.000 1.243 0.352`, `2.000 1.110 0.603`: blue 0.18 and 0.30 x
+red), the mirror of its blue fills (`0.586 1.243 2.000`, `0.692 1.243 2.000`). The sewer lamps
+the rule is for are a pale warm (`2.000 1.356 0.997`, `1.000 0.678 0.498`: blue 0.50 x red).
+
+The red >= 1 warm test now also needs blue >= 0.4 x red (`Rt::WarmLampBlue`), unless red > 3
+(`Rt::WarmFirePeak`): the burning house (`12.800 5.039 0.806`) and its `6.400 2.520 0.403`
+lights are fires whatever the hue. The lantern hue test is unchanged; flames still latch by
+flicker. Live knob `BB_RT_FILL_WARM_HUE` (0 = old rule). The latch is sticky, so an A/B goes
+new rule first. At the enclosure: player luma 47.6 / flowers 43.3 with the rule (moonlit, white
+flowers), 59.9 / 46.0 with `BB_RT_FILL_WARM_HUE=0` (amber wash).
+
+## Puddles: real water F0, soft rims (2026-11-10, `BB_RT_PUDDLE_EDGE`)
+
+The Hunter's Dream path is G-buffer water (`BB_RT_WATER_DEBUG=1`: cyan), where stock draws
+only wet mud. RT made every pixel with gloss >= 0.6 (`WaterPuddleGloss`) a mirror at
+`BB_RT_WATER_F0` 0.5. Seen from above it mirrored half the bright sky, and the hard gloss cut
+left jagged islands, so the puddles read as white blobs. Two changes:
+
+- `BB_RT_WATER_F0` default 0.5 -> 0.02, real water. The 0.5 was picked for the dark sewer,
+  where only the glint showed at 0.02; that water is now sheet water with its own
+  `BB_RT_WATER_SHEET_F0`. From above a puddle is now dark wet ground; at grazing angles it mirrors
+  the sky, as real puddles do.
+- The puddle fades in over the gloss range [0.6, 0.6 + `BB_RT_PUDDLE_EDGE`] (default 0.25, live,
+  0 = the old hard cut). The weight scales the mirror and the Fresnel share taken from the floor
+  under it, so the rim blends into dry mud.
+
+Live at the Dream path (puddle region mean luma): old 108.5, soft rim only 79.8, both 59.6.
+
+## Puddles: wet bed, clear water (2026-11-10, `BB_RT_PUDDLE_WET`)
+
+After the F0 fix the puddles still read foggy: the faint sky reflection lay over a bed lit as
+bright as dry mud, a milky film (PHOTOREAL 13: wet ground is 0.5-0.8x its dry albedo). The bed
+under a G-buffer puddle now keeps `BB_RT_PUDDLE_WET` (default 0.6, live, 1 = off) of its light,
+weighted by the soft-rim weight so the rim blends. Sheet water is unchanged.
+
+Live at the Dream path, interleaved off/on/off/on, puddle crop: p5 39/25/32/26, sd 36/44/39/45,
+Laplacian sharpness 162/204/185/180. The bed reads dark and the sky as a reflection on it.
+Ripple/rough to 0 were tried: no visible gain, the soft clouds are the sky itself.
+
+## Moon haze: the dome's fog kept off the disc (2026-11-13, `rt/rt_moon_haze.h`)
+
+From one side of Hemwick the moon was a flat grey disc (centre luma 54, contrast 1.26 to the sky;
+the other side 148, 2.6). The haze is the game's own fog in the sky dome pixel shader `dda49e89`
+(distance and height fog both mix the moon toward the fog colour), not our tracer and not the
+cloud layer `765450df`. `Rt::MoonHazeFix` rewrites the dome's SPIR-V when the recompiler emits it,
+so both fog factors are scaled by `1 - cut * moon`,
+`moon = smoothstep(0.1, 0.2, min channel of the unfogged colour)`: only the disc reaches that range
+in this shader (disc 0.25-1, horizon band about 0.02). Taking all the fog off clipped the disc to
+white (247/250); 0.5 still clipped (239); cut 0.09 gives centre 175, max 215, contrast 3.8, maria
+kept. The factors are found by shape (NClamp(x, 0, 1) feeding three FMul -> FAdd); anything else
+leaves the shader as it is. The pass edits only the shader the player's own game produced, so no
+game data ships with the port.
+
+Knob `BB_RT_MOON_HAZE` (default 0.09, 0 = off), read once at boot. The log prints
+`Moon haze: dome shader patched` (or `not matched, left as it is`).
+
+`PipelineCache::GetSourcePatch` runs it on compile and on the cache preload, without
+`BB_PATCH_SHADERS`. Dev override: a `<stage>_<hash>_src<FNV-1a 64 of the recompiler's SPIR-V>.spv`
+file in `<user>/shader/patch` replaces that exact permutation's SPIR-V first.
+
+## Moon penumbra: 1 extra ray instead of 2 (2026-11-13, `rt_direct.comp`)
+
+`MoonPenumbraRays` 2 -> 1. The one ray takes the cone cell opposite the pixel's `MoonConeU` cell
+(other ring, sector + 2), so a 4x4 block still covers all 8 cells twice and the 5x5 average stays
+stratified. Hemwick, still camera, interleaved 2/1/2/1/2: direct 10.9-11.1 -> 9.7 ms; temporal
+noise at the player's shadow edge p90 1.12-1.28 vs 1.17-1.47, wall shadow 0.76-0.80 vs 0.79-0.80,
+speckle the same; zoomed edges look the same.
+
+## Blood moon: screen moon search over warm samples (2026-11-13, `rt_sky.comp`)
+
+Cathedral Ward under the blood moon: moonlight came in 5 degrees over the horizon and 25 degrees
+to the side of the disc (long diagonal shadows, `BB_RT_DIRECT_DEBUG=11`). `FindScreenMoon` skips
+warm sky samples (red > 2x blue) so fire over the sky is never the moon, and the blood moon (r/b
+~5 on screen, as fire) was skipped with it; the search took pale clouds instead. A search over all
+samples landed 7 degrees off: the red disc's luma is no higher than the lit clouds around it.
+
+Now the search runs first over the warm samples alone (bright cut 0.5x the reference, samples
+unweighted) and takes that result only when it is a big compact disc high in the sky: at least
+150 samples in the cone, spread at most 10 degrees, centre over 10 degrees up. Otherwise it runs
+again over the other samples, as before. Fire over the sky (2 samples in the Hunter's Dream) stays
+out. Live, synced to `BB_RT_MOON_SCREEN_LOG=1`: the light lands on the disc's centre within 0.004
+uv across and 1.8 degrees up (disc radius ~7 degrees); 1700-1800 samples, spread 7.3-7.4. Not yet
+rechecked: the burning Hunter's Dream (fire with the pale moon).
+
+Follow-up, same day (`rt_gi.comp` `FindLayerMoon`): the light still swung as the player walked.
+With the disc out of view the search over pale samples took clouds 3-10 degrees up on any side
+(one behind the camera, `-0.44 0.17 0.88`), and after `MoonUnlock` searches they replaced the moon.
+A red disc's find now carries `ScreenMoonWarmTag` (0.5 in w); the first one of a run replaces any
+kept pale moon at once and sets a flag in layer row 0 cell 3 (reset on load), after which only red
+finds count. Live: 4 legs of walking and turning over 11 m, light `0.794 0.555 -0.247` throughout
+(was jumping up to ~100 degrees); the moon cache entries of this sky's cloud draws moved to the disc.
+
+## One moon rule for every world: a round mesh in front of the sky (2026-11-13, `rt_sky.comp`, `rt_gi.comp`)
+
+The red-only lock above broke the Hunter's Dream: its lit red clouds passed as "red discs" and the
+lock then dropped every pale moon find; the light sat 15 degrees off the moon. Every rule on the
+picture failed one world: colour (above), the brightest patch (lit clouds, fire), and a level fall
+at the disc's edge (the blood moon's shaded side and bright top at one threshold; the Dream moon's
+soft limb under thin cloud, edge contrast 1.8-2.5 against 1.1-2.4 for cloud patches, at the other:
+found in 1 search of 3, never enough to replace a kept light).
+
+The moon is a mesh of its own and it writes depth, so `FindScreenMoon` now reads the depth buffer
+and no colour. What the two skies look like there:
+
+| | Hunter's Dream (pale moon) | Cathedral Ward (blood moon) |
+|---|---|---|
+| Disc | flat, 748-750 m | bulged and tilted, 556-570 m |
+| Sky behind it | the dome, 1737 m (2.2x) | 565-684 m, uneven (1.0-1.2x); a cloud sheet meets the rim at the lower left |
+| Other depth edges in the sky | far pillars (773 m), cloud sheets | rounded cloud sheets, an unlit round mesh at 672-680 m |
+
+The search (one rule, both worlds):
+
+- Candidates. (1) Rim samples: the sky one grid step to both sides along x or y is farther by
+  0.4% of the range in sum. Each votes for the cells its centre may be in (inward along the step,
+  radius 3-17 rings); the 8 best cells are voted on again per radius, and the 2 with rim samples
+  from the most of 8 ways at one radius are tested. (2) Front samples: the sky 14 degrees of arc to
+  either side at the same height is 1.25x farther; the screen cell with the most is tested first.
+  The votes alone found the Dream moon in 1 search of 3 to 8 (pillars, cloud edges); the front
+  samples alone found the blood moon now and then (its sky is 1.0-1.2x farther).
+- The disc test, per candidate (`NearRange`, `DiscProfile` twice, from the candidate and from the
+  fitted centre): the disc is the sky within 3% of the range at the centre; nearer sky hides it,
+  as a branch does. In 8 directions the rim is where the share of samples on the disc falls under
+  half. A circle `r(a) = R + d.(cos a, sin a)` comes from every 3 rims (exact solve), the one
+  most rims agree with (within 1.25 rings of 0.75 degrees) wins, then least squares over those.
+- A find: at least 5 of 8 rims on the circle, radius 3-17 rings, and in those directions at least
+  85% of the sky inside the circle on the disc and at most 20% of the 3 rings past it; and the
+  disc is a light: its luminance (geometric mean) is 1.7x the sky's in those 3 rings, or 1.25x
+  when it is also 1.8x the whole sky's on screen (the Dream moon's halo fills the rings).
+  Without the fill a far pillar's stub passed in the Dream (6 rims, 43% inside); without the
+  glow the unlit round mesh and a rounded cloud sheet passed under the blood moon (0.4-1.5).
+- The find carries the disc's range. `FindLayerMoon` (`rt_gi.comp`) places the moon in the world
+  from it at once (camera + range x direction): the light points at that place from wherever the
+  player walks, and one look is enough. It was two sightings 10 m of walking apart before.
+
+Why the light went wrong without a look at the sky, and what changed (`rt_gi.comp`):
+
+- The CPU's reset (the layer's draws came back after a second away: a load, but also a look at
+  the ground or a walk under a roof) dropped the found moon; the light went back to the cached
+  direction of the cloud draws, which maps share (Cathedral Ward: 30 degrees off) until the player
+  looked at the disc again. Now a moon placed in the world this run is only dropped by a camera
+  jump of 100 m between two searches (a warp, a load).
+- A sky with no layer draws (Cathedral Ward under the blood moon) lost the moon 150 searches
+  after the disc left the screen. A placed moon is now kept.
+- `MoonUnlock` is 12 searches (4 frames apart: under a second); it was 40 (~3 s). The stray lock
+  itself stays: a spot off the kept moon replaces it only when seen 12 times, less 2 per search
+  with no disc.
+
+The moon cache (`rt_moon.txt`, per layer draw) now gets exact places. Before, a screen find was
+cached 2000 m out along its direction until two sightings a walk apart gave a distance: the
+Dream's moon sat at `-611 814 1677` (it is at `-204 297 614`, 748 m), and from another spot of
+the map the light started up to 30 degrees off. A wrong old entry is outvoted after 8 confirmed
+finds (`MoonCache::SwitchVotes`). Live: second arrival in Cathedral Ward "found 0.18 degrees from
+its cached position"; after a cold start facing away from the moon the light was on it from the
+first frame (`0.833 0.481 -0.275`, w 149), and 4 s of looking at the ground did not move it.
+
+`vk_ray_tracing.cpp` (eb0143e): a find is cached while the layer
+draws even when no draw was in every frame of the run (`SkyKey::Key()` 0, logged as sky
+`0000000000000001`); Cathedral Ward's first finds were dropped for that ("sky 0000000000000000
+found 30.63 degrees from its cached position"). Built and running; the case itself did not come
+up again live.
+
+Still needed: the first look ever at a sky's moon (the game draws the moon's mesh only while it
+is in view). A cache file filled in every area and shipped with the installer would cover it.
+
+Live, `BB_RT_MOON_SCREEN_LOG=1` (its "peak / mean / spread / bright samples" are now: rims if it
+passed, rims*1e6 + radius*1e4 + ring glow*100, the glow over the whole sky, the disc's range in m):
+
+| | Hunter's Dream | Cathedral Ward |
+|---|---|---|
+| Find, moon in view | 8 of 8 rims, 8.0 rings, 748 m, glow 1.5-1.6 (rings) and 2.3-2.9 (sky), every search | 6-7 of 8 rims, 5.3-5.5 rings, 558 m, glow 1.7-2.4 (rings) and 3.1-3.6 (sky), every search |
+| Light | `-0.326 0.416 0.849`, on the disc; right on arrival (cache) | `0.840 0.478 -0.257`, on the disc; was `0.593 0.384 -0.707` (30 degrees off) on the first visit, right on arrival on the second (cache) |
+| Sweeps of 360 degrees | 24 views, no false find | 34 views, no false find (the unlit mesh: 6 rims, glow 0.9 and 0.8) |
+| Walking, looking away | 6 legs, light on the moon's place | 2 x 6 legs, light on the moon's place |
+
+Cost, same view, interleaved 3 x 3 readings of the FPS counter: the committed colour searches 61.3 FPS, this 64.7 (Hunter's Dream, moon out of view). The search runs when the layer search has taken the last result (every 4th frame); every frame it cost 0.64 ms (59.9 against 62.3).
+
+## A third moon: Upper Cathedral Ward, and what it changed in the search (2026-11-13, `rt_sky.comp`, `rt_gi.comp`, `vk_ray_tracing.cpp`)
+
+Upper Cathedral Ward's moon lit nothing: the light stayed on the game's own direction ("moon
+light from the game's sets"). Three causes.
+
+- The sky pass (`RecordSky`) only ran while the game's dome draw (`SkyDomePs`, a 4:1 panorama) was
+  live, and that map's sky is another shader's: no dome, so no moon search at all. Now the moon
+  search runs alone when there is no dome (the depth view stands in for the dome texture).
+- That moon is a mesh 21 degrees wide at 450 m, its centre 2.7 degrees up and its lower half
+  behind the ruins; nothing is behind it (depth 1), flat cloud sheets with straight edges sit
+  above. The disc test needed 5 of 8 rims and a disc within 3% of its centre's range.
+- With only the top half in view the first-order circle `r(a) = R + d.(cos a, sin a)` put the
+  centre a degree low.
+
+The search after it (still depth only for the shape, luminance only to say "this is a light"):
+
+- Candidates from the votes are ranked by the luminance of their rim samples (the 2 brightest
+  with rims from 4 of 8 ways are tested); by ways and samples the cloud sheets' corners won
+  every time. The front cell's candidate is still tested first.
+- The disc's range runs from its centre's to its rim samples' (that mesh is over 3% farther at
+  the rim: about the centre alone the disc came out 8.6 rings wide, it is 14.3). When something
+  hides the centre the rim samples' range is used.
+- The circle is exact: `|q|^2 = 2 c.q + k` through the rim points, 3 at a time, then least
+  squares.
+- A half disc passes with 4 rims on the circle when at most one other direction has a rim and
+  the disc is 8x the whole sky's luminance (that moon: 27-75).
+- Where the sky behind the disc is at the disc's own range (Cathedral Ward on the second visit:
+  a cloud sheet at 600-617 m behind the whole blood moon at 594-597 m; the disc came out 15-19
+  rings wide and was dropped) a direction's rim is the first ring with rim samples (depth steps
+  facing away from the centre), when that comes 1.5 rings or more before the range's fall. Such
+  directions leave the test of the rings past the disc, and the disc must then pass the full
+  glow (1.7).
+- The glow is now the luminance inside the circle over the 3 rings past it, whatever the range
+  there. The halo rule asks 1.55 (was 1.25): a moonlit round cloud in the Hunter's Dream
+  (1320-1345 m, 6 rims, 1.42-1.46, 3.2-4.0 over the sky) passed at 1.25 and, seen for a second,
+  took the light.
+- `FindLayerMoon` keeps the glow of the kept moon and of the stray spot it is counting (row 0
+  cell 5): a stray with less glow never replaces the kept moon, one with more does after
+  `MoonUnlock` sightings. Found first, the cloud still gives way to the moon.
+- A later find moves the placed moon a twentieth of the way (was a quarter): finds of one disc
+  scatter 0.4-0.7 degrees with the clouds behind it.
+
+Live, the same shader in the three maps (`BB_RT_MOON_SCREEN_LOG=1`; "peak" is now the ring glow
+of the disc that passed):
+
+| | Hunter's Dream | Cathedral Ward | Upper Cathedral Ward |
+|---|---|---|---|
+| Find, moon in clear view | 6-8 rims, 8.1 rings, 732 m, glow 2.0-2.5 | 5-7 rims, 6.0-7.1 rings, 593-598 m, glow 2.4-4.2 | 4 rims, 14.3-15.1 rings, 440-451 m, glow 75 |
+| Light | on the disc, right on arrival (0.55 degrees from the cache) | on the disc, right on arrival (0.27-0.43 degrees from the cache) | on the disc: centre 2.5 degrees up, top 13.4 (the picture: 13.5); was the game's direction |
+| Sweeps of 360 degrees | 14 views, no false find | 3 x 12 views, no false find | 2 x 10 views, no false find |
+| Walking | light on the moon's place | 6 legs, light on the moon's place | 2 x 6 legs, light on the moon's place |
+
+Not found, light kept: the blood moon with the hunter or a wall over part of it, Upper Cathedral
+Ward's moon in about half the views (cloud corners take the 3 tries). Cost: 56.2 FPS before and after (Cathedral Ward, interleaved 3 x 3 readings).
+
+## The first disc must be seen three times (2026-11-13, `rt_gi.comp`)
+
+Nightmare Frontier, on arrival: one stray find (`0.799 0.150 -0.583`, never seen again) was taken
+as the moon at once, and since a placed moon is kept until the next warp the light stayed behind
+the rocks: the whole map in its shadow. `FindLayerMoon` now counts the finds of the first disc of
+a run at one spot (within 3 degrees; row 0 cell 3, w 10 + the count) and replaces the kept
+direction (the game's or the cache's) at the third (`MoonFirst`); a find elsewhere restarts the
+count. The cells' tag went from 2 to 3, and a search with no tagged camera resets, so a session
+never starts from another layout's cells.
+
+Live: the stray moon was dropped on the swap (back to the game's sets). That sky does hold a
+light: a veiled sun, a disc of 5 rings at 1010 m, 34 degrees up, 6 rims, glow 1.59 and 1.9 over the
+sky. It was confirmed and placed (`-0.069 0.559 0.826`) and cached; after a cold start facing away
+the light was on it from frame 2776.
+
+Open, not a moon matter: Nightmare Frontier is far darker than stock where the view is against
+the light (RT p5 4, p20 5, p50 10, 13.7% of the pixels under 5, p90/p20 23; stock p5 10, p20 17,
+p50 60, 0.4%, 5.7). `BB_RT_GI_FILL_SKY=4` changed nothing; `BB_RT_GI_STRENGTH=0` took p20 from 5 to
+3. `BB_RT_PICK` on three rock pixels facing the sun (n.L 0.33-0.86) from the player's own view:
+moon visibility 0, the blocker a back face of a rock mesh 0.05, 0.46 and 3.71 m along the ray (ps
+`dbb222eb`, `aa2a9925`, `6b45aeff`). The rocks there overlap each other, or the traced meshes sit
+off the drawn ones; not looked into yet.
+
+## No visible moon or sun: the game's direction stays (2026-11-13, `rt_sky.comp`, `rt_gi.comp`)
+
+The user's rule: with no moon or sun to be seen in the sky, light 1 keeps the stock game's
+direction. The Nightmare Frontier broke it twice after the first-disc fix above.
+
+- Its sun is a disc at 1010 m behind the haze: only a glow in the clouds, ring glow 1.58-1.59, 1.9
+  over the whole sky. The halo rule (1.55 with 1.8 over the sky) took it as the moon.
+- A far rock (759 m, sky by the dome-range test; 6 rims, ring glow 1.97, 0.4 over the whole sky:
+  darker than the sky, the haze around it darker still) passed on the rings alone. With more ring
+  glow than the sun it replaced it ("a disc with less glow never replaces the kept one" worked
+  against us), the cache took its place (`556 1623 -555`), and the light came from the rocks, 9
+  degrees up: the map dark, the lighting moving as the finds went back and forth.
+
+Now one glow rule: the luminance inside the circle is 1.8x the sky's in the 3 rings past it
+(`ScreenMoonGlow`; the halo rule and `md_edge` are gone) and at least 1.3x the whole sky's
+(`ScreenMoonSkyFloor`). In clear view the Dream moon has 2.0-2.5, the blood moon 2.4-4.2, Upper
+Cathedral Ward's 10+; the Dream moon at the screen edge or behind branches (1.6) is no longer
+confirmed there, the light keeps its place. In `FindLayerMoon` the kept moon's glow fades 3% per
+search while it sits within 15 degrees of the view's axis and is not found, so a kept disc that
+is one no longer gives way to the next.
+
+Live, Nightmare Frontier: the two cache lines of the rock removed by hand; after a cold start
+"moon light from the game's sets", 12 views of a sweep with the sky and the sun's glow in them,
+no find; the open ground lit as stock lights it. Not run again after this change: the Hunter's
+Dream, Cathedral Ward and Upper Cathedral Ward (their glows above are from the runs before it).
+
+The darkness noted in the section above was mostly this (the light from the rocks, then from the
+veiled sun behind the cliffs); from the game's direction the same map is lit. The `BB_RT_PICK`
+blockers on back faces were read with those lights and are not checked again.
+
+## Sky flicker under the fog pass, Nightmare Frontier: open (2026-11-13)
+
+Not the moon code. `tools/live_vision.py measure` on the sky of one still view: flicker sd 12-16%,
+peak to peak ~50%, with RT; 0.1% stock; the same with `BB_RT_MOON_FROM_SKY=0` and with the shaders
+of 49f0157; 0.0-0.1% with `BB_RT_FOG_STOCK=1`. The fog there is thick (extinction 0.0034/m,
+transmittance 0.07 over the 1115 m to the sky), so a sky pixel is 93% in-scatter, and
+`BB_RT_PICK` on one sky pixel, every frame, has the march integral at 0.19, 0.20 or 0.35 and the
+sky part between 0.006 and 0.157. Why the 0.9 history does not even that out is not found
+(`BB_RT_FX_FOG_DEBUG=5` shows the history lost over the geometry in some frames).
+
+Until it is fixed the live `rt.cfg` carries `BB_RT_FOG_STOCK=1` (the user's choice): the game's
+own fog in every map.

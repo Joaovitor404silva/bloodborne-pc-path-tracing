@@ -63,6 +63,7 @@ struct SurfaceRecord {
     uint flags;
     uint uv_base;
     float alpha_ref;
+    uint flags2;
 };
 
 layout(binding = 12, std430) readonly buffer Surfaces {

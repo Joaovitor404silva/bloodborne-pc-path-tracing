@@ -24,6 +24,8 @@
 #include "video_core/renderer_vulkan/rt/rt_hot.h"
 #include "video_core/renderer_vulkan/rt/rt_lights.h"
 #include "video_core/renderer_vulkan/rt/rt_live.h"
+#include "video_core/renderer_vulkan/rt/rt_moon_cache.h"
+#include "video_core/renderer_vulkan/rt/rt_sky_cache.h"
 #include "video_core/renderer_vulkan/rt/rt_restir_gi.h"
 #include "video_core/renderer_vulkan/rt/rt_surface.h"
 #include "video_core/renderer_vulkan/rt/rt_toggle.h"
@@ -42,9 +44,15 @@ class Instance;
 class Scheduler;
 class Runtime;
 class SceneTargets;
+class ObjectMotion;
 
 class RayTracing {
 public:
+    /// The game's object motion vectors (the moon history follows moving objects with them).
+    void SetObjectMotion(ObjectMotion* motion) noexcept {
+        object_motion = motion;
+    }
+
     struct SceneInputs {
         VideoCore::ImageId depth{};
         std::array<float, 4> projection{};
@@ -171,7 +179,7 @@ public:
     // BB_RT_SKIP_VOLUMES: the game's volumetric light shafts are skipped while our traced fog
     // runs (it scatters light only from traced sources: moon, lamps, emitters, sky).
     bool SkipGameVolumes() const;
-    bool SkipHalfResLight(VideoCore::ImageId target, bool blended) const;
+    bool SkipHalfResLight(VideoCore::ImageId target, bool blended, u64 ps_hash) const;
     [[nodiscard]] bool WantsDirShadowMask(u64 ps_hash) const noexcept {
         return direct_enabled && Rt::DirShadowMaskDraw(ps_hash);
     }
@@ -329,6 +337,7 @@ private:
         u32 skin_step{};
         bool anchored{};
         bool kept{};
+        u32 glass_mask{};
     };
     struct SkinState {
         u32 entry{}, mode{}, step{}, mask{}, flags{}, slot{}, triangles{};
@@ -379,7 +388,8 @@ private:
     void LogLiveState();
     bool CreateGiImages(u32 width, u32 height);
     void DestroyGiImages();
-    bool MakeOwnImage(OwnImage& own, vk::Format format, u32 width, u32 height);
+    bool MakeOwnImage(OwnImage& own, vk::Format format, u32 width, u32 height,
+                      vk::ImageUsageFlags extra_usage = {});
     bool CreateReflectImages(u32 width, u32 height);
     bool CreateAoImages(u32 width, u32 height);
     void DestroyAoImages();
@@ -400,11 +410,15 @@ private:
     bool RecordGi(const SceneInputs& inputs);
     void ApplyFillVis();
     void ReadFillVis();
+    void RecordSkyLayer(vk::CommandBuffer cmdbuf, std::span<const vk::WriteDescriptorSet> gi_writes);
+    void ReadMoonRing();
+    void SkyImageIo(vk::CommandBuffer cmdbuf, u64 key);
     void RecordFillVis(vk::CommandBuffer cmdbuf, std::span<const vk::WriteDescriptorSet> gi_writes,
                        const Rt::Affine& view, u32 slot);
     void RecordShadows(const SceneInputs& inputs);
     void RecordFog(const SceneInputs& inputs);
     void RecordSky(const SceneInputs& inputs);
+    void RecordExposure(const SceneInputs& inputs, bool apply);
     bool SkyDomeLive() const;
     bool CreateFogImages(u32 width, u32 height);
     void DestroyFogImages();
@@ -415,6 +429,11 @@ private:
         u32 bytes{};
     };
     GpuSets ObtainGpuLightSets(u64 max_age);
+    // The direct pass's moon set vote, written into GiParams.sharc.w of a GI/reflection params slot.
+    void RecordWorldSet(vk::CommandBuffer cmdbuf, vk::ImageView depth_view, vk::ImageView g3_view,
+                        const vk::DescriptorBufferInfo& sets, u32 set_count, u32 width, u32 height,
+                        vk::Buffer params, u64 params_offset);
+    void RecordMoonDir(vk::CommandBuffer cmdbuf, u64 sets_offset, u32 sets_bytes);
     void LogSetSource(const char* pass, const GpuSets& s, u32 sets, u32 lights);
     void ApplySetReadback();
     void LogDirSets();
@@ -523,6 +542,19 @@ private:
     std::array<u32, Slots> pick_built{};
     std::array<u64, Slots> pick_snap_frame{};
     std::array<std::vector<PickInstance>, Slots> pick_snap;
+    // Kept-instance probe (BB_RT_KEPT_PROBE, words 128..255 of the pick ring): camera rays on a
+    // coarse grid that hit a kept off-screen instance in front of the drawn surface. The game no
+    // longer draws it there (a far LOD twin over the near floor shaded the floor black), so it is
+    // not kept again until the game draws it.
+    bool kept_probe = true;
+    std::array<std::vector<u32>, Slots> kept_snap; // TLAS index -> kept entry id, ~0u otherwise
+    std::array<u64, Slots> kept_snap_frame{};
+    std::array<u64, Slots> kept_probe_tick{};
+    std::array<u64, Slots> kept_probe_frame{~0ull, ~0ull, ~0ull};
+    std::array<u32, Slots> kept_probe_built{};
+    u64 kept_probe_hidden = 0, kept_probe_reads = 0, kept_probe_hits = 0;
+    u32 kept_probe_log_lines = 0;
+    void ReadKeptProbe();
     std::vector<Rt::DrawTag> entry_tags;
     u64 pick_logged_frame = 0;
     u32 frame_draws = 0;
@@ -560,6 +592,7 @@ private:
         VideoCore::ImageId id{};
         u64 uid{};
         vk::ImageView view{};
+        bool own{};
     };
     std::array<std::vector<TextureRef>, Slots> slot_textures;
     static constexpr u32 SurfaceSetRing = 24;
@@ -618,6 +651,14 @@ private:
              holds = true;
     } off_switches;
     std::array<float, 2> light_keep_proj{};
+    // Scene camera at the end of the light frame (BB_RT_LIGHT_KEEP_SCENE): culls kept lights and
+    // glow lamps instead of the camera in the game's light draws.
+    Rt::Affine light_keep_inv_view{};
+    bool light_keep_cam = false;
+    bool light_keep_scene = true;
+    u64 light_keep_scene_frames = 0;
+    float light_keep_cam_gap = 0.0f;
+    void SetLightKeepCamera(const SceneInputs& inputs) noexcept;
     u64 pool_full_draws = 0;
     u64 retired_bytes = 0;
     u64 scratch_alignment = 256;
@@ -695,12 +736,81 @@ private:
     Rt::Affine frame_inv_view{};
 
     vk::UniqueDescriptorSetLayout gather_layout, debug_layout, probe_layout, gi_layout, apply_layout,
-        shadow_layout, direct_layout, fog_layout, fog_apply_layout, sky_layout;
+        shadow_layout, direct_layout, fog_layout, fog_apply_layout, sky_layout, world_set_layout;
     vk::UniquePipelineLayout gather_pipeline_layout, debug_pipeline_layout, probe_pipeline_layout,
         gi_pipeline_layout, apply_pipeline_layout, shadow_pipeline_layout, direct_pipeline_layout,
-        fog_pipeline_layout, fog_apply_pipeline_layout, sky_pipeline_layout;
+        fog_pipeline_layout, fog_apply_pipeline_layout, sky_pipeline_layout,
+        world_set_pipeline_layout;
     vk::UniquePipeline gather_pipeline, debug_pipeline, probe_pipeline, gi_pipeline, apply_pipeline,
-        shadow_pipeline, direct_pipeline, fog_pipeline, fog_apply_pipeline, sky_pipeline;
+        shadow_pipeline, direct_pipeline, fog_pipeline, fog_apply_pipeline, sky_pipeline,
+        world_set_pipeline;
+    u64 world_set_frames = 0;
+    bool gi_world_set = true;
+    // rt_moon_dir.comp: light 1 of the set copy points at the moon the sky draws.
+    vk::UniqueDescriptorSetLayout moon_dir_layout;
+    vk::UniquePipelineLayout moon_dir_pipeline_layout;
+    vk::UniquePipeline moon_dir_pipeline;
+    // rt_exposure.comp: eye adaptation of the traced image (BB_RT_EXPOSURE).
+    static constexpr float ExposureKeyDefault = -5.5f;
+    vk::UniqueDescriptorSetLayout exposure_layout;
+    vk::UniquePipelineLayout exposure_pipeline_layout;
+    vk::UniquePipeline exposure_pipeline;
+    HostRing exposure_ring;
+    bool exposure_on = true;
+    bool exposure_reset = true;
+    float exposure_key = ExposureKeyDefault;
+    float exposure_max = 1.5f;
+    float exposure_rate = 0.03f;
+    float exposure_white = 3.0f;
+    float thin_transmit = 0.4f; // BB_RT_THIN_TRANSMIT: moonlight through thin cards
+    u64 exposure_frames = 0;
+    u64 moon_dir_frames = 0;
+    bool moon_from_sky = true;
+    // rt_gi.comp RT_SKY_LAYER: the moon and cloud layer grid and the moon search.
+    vk::UniqueDescriptorSetLayout sky_layer_layout;
+    vk::UniquePipelineLayout sky_layer_pipeline_layout;
+    vk::UniquePipeline sky_layer_pipeline;
+    float moon_min = 0.2f;
+    u64 sky_layer_frames = 0;
+    // The moon per sky model (rt_moon_cache.h): keyed by the layer draws, read back from the
+    // sky layer pass, seeded into it while the game culls the disc.
+    Rt::SkyKey sky_key;
+    Rt::MoonCache moon_cache;
+    std::string moon_cache_path;
+    u64 moon_generation = 0;
+    bool moon_found_run = false; // a confirmed find this layer run
+    bool moon_last_found = false;
+    // Logged source of light 1 (0 game sets, 1 sky moon, 2 sky moon fading out).
+    int moon_source_logged = -1;
+    u64 moon_stats_logged = 0;
+    u64 moon_screen_logged = 0;
+    bool moon_layer_find = false;  // BB_RT_MOON_LAYER_FIND
+    std::array<float, 2> frame_proj_scale{}; // projection x/y scale of the last built frame
+    std::array<float, 3> moon_last{}, moon_confirmed{};
+    static constexpr u32 MoonRingSlotBytes = 80;
+    std::array<Rt::Affine, 3> moon_ring_view{};
+    HostRing moon_ring;
+    std::array<u64, 3> moon_ring_tick{};
+    std::array<u64, 3> moon_ring_frame{~0ull, ~0ull, ~0ull};
+    std::array<u64, 3> moon_ring_key{};
+    std::array<u64, 3> moon_ring_gen{};
+    // The learned sky image per sky model on disk (rt_sky_cache.h, BB_RT_SKY_CACHE): loaded when
+    // a sky appears, read back every SkyIoEvery frames and saved when it has grown.
+    static constexpr u64 SkyIoEvery = 240;
+    enum class SkyIo { Idle, Upload, Readback };
+    SkyIo sky_io = SkyIo::Idle;
+    bool sky_io_failed = false;
+    vk::Buffer sky_io_buffer{};
+    VmaAllocation sky_io_allocation{};
+    float* sky_io_mapped = nullptr;
+    u64 sky_io_tick = 0;
+    u64 sky_io_key = 0;
+    u64 sky_io_generation = 0;
+    u64 sky_io_next = 0;
+    u64 sky_seed_key = 0;
+    u64 sky_seed_generation = ~0ull;
+    std::string sky_cache_dir;
+    std::unordered_map<u64, size_t> sky_saved_seen;
 
     bool gi_enabled = false;
     u32 gi_spp = 1;
@@ -709,6 +819,7 @@ private:
     u32 gi_denoise = 2;
     float gi_debug_threshold = 0.0f;
     float gi_strength = 1.0f;
+    float gi_fill_sky = 1.0f;
     float gi_sky = 0.0f;
     float gi_clamp = 4.0f;
     float gi_bias = 0.02f;
@@ -773,7 +884,7 @@ private:
     u64 direct_depth_normal_frames = 0;
     bool gbuffer_printed = false;
     VideoCore::ImageId scene_color{};
-    u64 gi_frames = 0, gi_skipped = 0, gi_resets = 0;
+    u64 gi_frames = 0, gi_skipped = 0, gi_resets = 0, gi_early_composites = 0;
     u64 last_gi_frame = ~0ull;
     u64 last_post_frame = ~0ull;
     bool history_valid = false;
@@ -891,6 +1002,7 @@ private:
         bool inherited = false; // seeded from a neighbour cell (a moving light), not traced yet
         bool lamp = false;      // latched: enclosed >= BB_RT_LAMP_ENCLOSED (a glass-housed lamp)
         bool fire_pit = false;  // latched: as enclosed but open above (Rt::FillVisFirePit)
+        bool pulse = false;     // latched: its colour pulses (BB_RT_FILL_FLICKER), an animated source
         std::array<float, 3> game_color{};
         // Flicker (BB_RT_FILL_FLICKER): the game's colour sum last frame, the sign of its last
         // change, and how many times the change reversed direction.
@@ -914,6 +1026,10 @@ private:
     u32 fill_vis_rays = 256;
     u32 fill_vis_refresh = 120;
     float emitter_range = 4.0f;
+    float emitter_bright = 2.0f;
+    float emitter_big_flicker = 0.5f;
+    float emitter_big_fast = 0.5f;
+    float emitter_big_gain = 1.5f;
     float emitter_source = 0.25f;
     float emitter_lift = 0.0f;
     float emitter_peak = 1.0f;
@@ -923,6 +1039,8 @@ private:
     float emitter_flicker_smooth = 0.1f;
     float emitter_sway = 0.15f;
     float emitter_steady_flicker = 0.35f;
+    float emitter_steady_dev = 0.05f;
+    float fixed_sway = 0.015f;
     float candle_rmax = 3.0f;
     float candle_source = 0.85f;
     float glow_flame = 1.0f;
@@ -963,6 +1081,7 @@ private:
     float fill_vis_cluster = 2.0f;
     float fill_vis_flicker = 0.01f;
     bool fill_vis_warm = true;
+    float fill_vis_warm_hue = Rt::WarmLampBlue;
     float fill_vis_lamp_min = Rt::LampMinColour;
     u32 fill_vis_cluster_last = 0;
     std::vector<std::array<float, 3>> fill_vis_emitter_pos;
@@ -981,6 +1100,7 @@ private:
     u64 direct_sets_gpu_frames = 0;
     bool moon_mask = false;
     float moon_cone_cos = 1.0f;
+    float moon_min_elevation = 0.0f; // BB_RT_MOON_MIN_EL, degrees
     bool moon_static = true;
     float restir_gi_jacobian = Rt::RestirGiJacobianDefault;
     u32 moon_half = 2;
@@ -1067,14 +1187,39 @@ private:
     // reflection pass.
     bool glass_on = true;
     std::vector<u64> glass_ps;
+    std::vector<u32> glass_caps; // per glass_ps entry ("hash:cap"), 0 = BB_RT_GLASS_MAX_TRIS
     float glass_gloss = 0.55f;
     // BB_RT_GLASS_MAX_TRIS: a BB_RT_GLASS_PS draw is glass only when its mesh has at most this
     // many triangles: a guard in case a listed shader also draws large building meshes.
     u32 glass_max_tris = 2000;
     bool GlassDraw(u64 ps, u32 triangles) const {
-        return glass_on && Rt::HashListed(glass_ps, ps, 0) &&
-               (glass_max_tris == 0 || triangles <= glass_max_tris);
+        if (!glass_on || !ps) {
+            return false;
+        }
+        for (size_t i = 0; i < glass_ps.size(); ++i) {
+            if (glass_ps[i] == ps) {
+                const u32 cap = glass_caps[i] ? glass_caps[i] : glass_max_tris;
+                return cap == 0 || triangles <= cap;
+            }
+        }
+        return false;
     }
+    // Masked glass: a BB_RT_GLASS_PS draw (also one over the triangle cap: the workshop bottle
+    // shelves mix glass and metal in one mesh) is glass only where a hand-painted mask of its
+    // albedo is white (all black: no glass, the workshop mirror): <dir of BB_RT_CFG>/glass_masks/<XXH3 of the guest texture, 16 hex>.pgm (P5, 8 bit,
+    // any size). The record then carries the mask's texture slot as -alpha_ref (GlassAt in the
+    // shaders). BB_RT_GLASS_MASK_DUMP=1 writes each such albedo (mip 0, raw) to
+    // glass_masks/dump/<hash>_<w>x<h>_<vk format>.raw for painting. Any rt.cfg change rescans.
+    std::unordered_map<u64, s32> glass_mask_by_uid;  // albedo image uid -> mask image, -1 none
+    std::unordered_map<u64, s32> glass_mask_by_hash; // texture hash -> mask image, -1 none
+    std::vector<OwnImage> glass_mask_images;
+    std::unordered_map<u64, std::pair<s64, s32>> glass_mask_files; // hash -> file time, image
+    std::unordered_set<u64> glass_mask_dumped;
+    bool glass_mask_dump = false;
+    std::string glass_mask_dir;
+    void GlassMaskSlots(vk::CommandBuffer cmdbuf);
+    s32 GlassMaskLoad(vk::CommandBuffer cmdbuf, u64 hash);
+    void GlassMaskDump(vk::CommandBuffer cmdbuf, const VideoCore::Image& image, u64 hash);
     // Painted windows as portals (BB_RT_PORTAL*, live): shadow rays that reach a pane of a
     // BB_RT_PORTAL_PS draw first count as reaching the outside, so the moon and lamps outside
     // shine in through the fake window. Same triangle cap as glass.
@@ -1097,6 +1242,8 @@ private:
     float water_body = 0.05f;
     float water_sheen = 0.0f;
     float water_sheen_far = 1.0f;
+    float water_puddle_edge = 0.25f;
+    float water_puddle_wet = 0.6f;
     float water_ripple = 0.1f;
     float water_sheet_f0 = 0.5f;
     float water_mist = 0.0f;
@@ -1196,7 +1343,12 @@ private:
         Rt::DrawInput draw{};
         Rt::Affine inv_view{};
         bool camera_valid{};
+        // The moon and cloud layer keeps its texture over to the replay (OnDrawBound).
+        vk::ImageView albedo_view{};
+        VideoCore::ImageId albedo_image{};
+        u64 albedo_uid{};
     };
+    bool last_add_late = false;
     std::vector<LateDraw> late_held;
     std::unordered_set<u32> late_entries;
     u32 late_mode = 1;
@@ -1225,6 +1377,20 @@ private:
     vk::UniquePipeline restir_temporal_pipeline, restir_spatial_pipeline;
     bool CreateReservoirs(u32 width, u32 height);
     void DestroyReservoirs();
+    // Moon visibility history (BB_RT_MOON_HISTORY, rt_direct.comp MoonHistory): ping-pong
+    // vec2 (visibility, view z) per pixel, reprojected with the last direct frame's camera.
+    std::array<DeviceBuffer, 2> moon_hist{};
+    u32 moon_hist_width = 0, moon_hist_height = 0, moon_hist_index = 0;
+    u64 moon_hist_frame = ~0ull, moon_hist_resets = 0, moon_hist_frames = 0;
+    bool moon_history = true;
+    bool moon_object_motion = true; // BB_RT_MOON_OBJECT_MOTION (live)
+    u64 moon_object_frames = 0;
+    ObjectMotion* object_motion = nullptr;
+    Rt::Affine moon_prev_inv_view{};
+    std::array<float, 4> moon_prev_projection{};
+    std::array<float, 2> moon_prev_jitter{};
+    bool CreateMoonHistory(u32 width, u32 height);
+    void DestroyMoonHistory();
 };
 
 }
