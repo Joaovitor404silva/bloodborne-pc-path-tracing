@@ -52,6 +52,8 @@ stock lighting. Give it about 3 seconds after each press while the exposure adju
 and shadows, each Auto (recommended), Low, Medium, High or Custom (a slider). More `BB_RT_*`
 variables go in Advanced > Diagnostics > Extra variables.
 
+![The launcher's Path tracing settings: bounce light, reflections and shadows presets](docs/media/launcher-path-tracing.png)
+
 **Upscalers:** DLSS, FSR 3.1 and FSR 4.1 all work with path tracing, with frame generation too.
 
 **Updates:** the launcher only offers releases of this repository, so an update never removes
@@ -73,7 +75,13 @@ release stayed off and pt2.2 traced every in-game frame.
 
 ## Source
 
-`source/` holds only our work; SuperMedo's code is in his repository.
+**Full source, ready to build:** the branch
+[path-tracing-1.9.8.6](https://github.com/Joaovitor404silva/bloodborne_pc/tree/path-tracing-1.9.8.6)
+of our fork of SuperMedo's repository: all his files at `windows-v1.9.8.6` plus our work in one
+commit. Its `README-PathTracing.md` builds the full download with his own scripts
+(`build.sh`, `build_dlss.sh`, `package.sh`).
+
+`source/` here holds only our work; SuperMedo's code is in his repository.
 
 - Files we wrote are there as they are: the path tracer
   (`source/gpu/shadps4/video_core/renderer_vulkan/rt/`), its shaders
