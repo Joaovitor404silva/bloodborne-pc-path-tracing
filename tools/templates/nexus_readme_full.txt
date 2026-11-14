@@ -10,9 +10,9 @@ All credit for the port goes to SuperMedo: https://github.com/Supermedo/bloodbor
 
 This Nexus zip is NOT the full download. Nexus blocks .exe files, and both the
 launcher (Bloodborne.exe) and the path tracing engine (bin\bb-probe.exe) are .exe.
-This zip holds only the mod's 3 other files:
+This zip holds only 2 of the mod's files (NVIDIA's Ray Reconstruction DLL,
+bin\nvngx_dlssd.dll, is in the GitHub download):
 - bin\bbport_dlss.dll   DLSS bridge with Ray Reconstruction
-- bin\nvngx_dlssd.dll   NVIDIA DLSS Ray Reconstruction
 - bin\libc++.dll        newer C++ runtime the engine needs
 
 INSTALL
