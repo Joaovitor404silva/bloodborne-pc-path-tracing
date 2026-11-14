@@ -77,8 +77,8 @@ looked like stock. The loading screen filled its memory and none of it was ever 
 frees it at the end of each frame. In our test from a fresh install (DLSS), the previous
 release stayed off and pt2.2 traced every in-game frame.
 
-FSR 4.1 and frame generation are not tested again yet, so the installer still picks DLSS or
-FSR 3.1 instead of FSR 4.1.
+Since pt2.3 frame generation works with path tracing (DLSS Frame Generation, FSR 3.1 frame
+generation). The installer still picks DLSS or FSR 3.1 as the upscaler instead of FSR 4.1.
 
 ## Uninstall
 
