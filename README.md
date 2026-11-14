@@ -1,4 +1,4 @@
-# Bloodborne PC Path Tracing installer
+# Bloodborne PC Path Tracing
 
 Adds real-time path tracing to [SuperMedo's Bloodborne PC port](https://github.com/Supermedo/bloodborne_pc):
 moonlight and bounce light, traced shadows and reflections, water and puddle mirrors, traced glass.
@@ -18,57 +18,51 @@ moonlight and bounce light, traced shadows and reflections, water and puddle mir
 ## Download
 
 **[Download the latest release](https://github.com/Joaovitor404silva/bloodborne-pc-path-tracing/releases/latest)**
-(`Bloodborne-PC-Path-Tracing-pt2.3.zip`).
+(`Bloodborne-Windows.zip`).
+
+It is SuperMedo's whole Bloodborne PC 1.9.8.6 with path tracing built in: one unzip, nothing to
+install on top. All credit for the port (launcher, DLSS/FSR, online, everything but path tracing)
+goes to [SuperMedo](https://github.com/Supermedo/bloodborne_pc). Report path tracing problems
+here, not to him.
 
 ## Needs
 
-- Bloodborne PC **1.9.8.6** (SuperMedo), installed and working:
-  [windows-v1.9.8.6](https://github.com/Supermedo/bloodborne_pc/releases/tag/windows-v1.9.8.6)
 - A ray tracing GPU: GeForce RTX or Radeon RX 6000 and newer.
 - Your own copy of the game. No game files are included.
 
-## What the mod is
+## Install
 
-Four files on top of SuperMedo's port; everything else stays his:
+1. Unzip `Bloodborne-Windows.zip` into a new folder (do not unzip over another Bloodborne PC).
+2. Start `Bloodborne.exe` and set the game up as in SuperMedo's port.
+
+Path tracing is on by default. In game, press **F9** to turn it off and on and compare with the
+stock lighting. Give it about 3 seconds after each press while the exposure adjusts.
+
+## What is different from SuperMedo's 1.9.8.6
 
 | File | What it is |
 |---|---|
 | `bin/bb-probe.exe` | The port's game engine, built from his source with the path tracer added |
 | `bin/bbport_dlss.dll` | The DLSS bridge, with Ray Reconstruction added |
 | `bin/nvngx_dlssd.dll` | NVIDIA's DLSS Ray Reconstruction (new file) |
-| `bin/libc++.dll` | MSYS2's newer LLVM C++ runtime: the engine needs a function his copy lacks; every other program and DLL of the port is checked to work with it |
+| `bin/libc++.dll` | MSYS2's newer LLVM C++ runtime: the engine needs a function his copy lacks |
+| `Bloodborne.exe` | His launcher with a Path tracing section; its updates come from this repository |
 
-Path tracing is switched on by a line of variables in his launcher: Advanced > Diagnostics >
-Extra variables. The installer writes it for you.
+**Launcher, Picture & performance > Path tracing:** the switch, then bounce light, reflections
+and shadows, each Auto (recommended), Low, Medium, High or Custom (a slider). More `BB_RT_*`
+variables go in Advanced > Diagnostics > Extra variables.
 
-## Install
+**Upscalers:** DLSS, FSR 3.1 and FSR 4.1 all work with path tracing, with frame generation too.
 
-1. Close the game and the launcher.
-2. Unzip the release anywhere (inside the Bloodborne PC folder is easiest).
-3. Run `Install Path Tracing.bat`. It finds the game folder, or asks for it.
-4. Start `Bloodborne.exe` as usual.
-
-In game, press **F9** to turn path tracing off and on and compare with the stock lighting.
-Give it about 3 seconds after each press while the exposure adjusts.
-
-The installer checks the folder is 1.9.8.6, backs up the 3 files it replaces to `rt-backup`,
-copies the 4 files and checks each by SHA-256. It adds the path tracing variables to the
-launcher's Extra variables and keeps any you already had.
-
-In a protected folder such as Program Files, Windows asks for administrator rights. If a copy
-fails (a file in use by the game or an antivirus), the installer puts every file back, leaves the
-folder as it was, and says what failed.
-
-**Upscaler:** path tracing is not tested under FSR 4.1, which is the launcher's
-automatic pick. In that case the installer sets DLSS on NVIDIA cards and FSR 3.1 on others.
-Keep DLSS or FSR 3.1.
-
-**Launcher updates:** an update of Bloodborne PC replaces `bb-probe.exe`, and path tracing is
-gone. Install the mod version made for the new Bloodborne PC; do not run the old version's
-uninstaller after updating.
+**Updates:** the launcher only offers releases of this repository, so an update never removes
+path tracing.
 
 **Seamless co-op:** the launcher's Seamless co-op mode runs its own engine
 (`bb-probe-seamless.exe`) without path tracing. Path tracing works in normal play.
+
+**Older 4-file installer:** for an existing Bloodborne PC 1.9.8.6 folder it is still in the
+[pt2.3 release](https://github.com/Joaovitor404silva/bloodborne-pc-path-tracing/releases/tag/pt2.3)
+(`installer/`).
 
 ## Fixed in pt2.2: path tracing staying off
 
@@ -77,14 +71,6 @@ looked like stock. The loading screen filled its memory and none of it was ever 
 frees it at the end of each frame. In our test from a fresh install (DLSS), the previous
 release stayed off and pt2.2 traced every in-game frame.
 
-Since pt2.3 frame generation works with path tracing (DLSS Frame Generation, FSR 3.1 frame
-generation). The installer still picks DLSS or FSR 3.1 as the upscaler instead of FSR 4.1.
-
-## Uninstall
-
-Run `Uninstall Path Tracing.bat`. It restores the 3 backed-up files, removes NVIDIA's Ray
-Reconstruction DLL, takes the variables out of Extra variables and puts your old upscaler back.
-
 ## Source
 
 `source/` holds only our work; SuperMedo's code is in his repository.
@@ -92,7 +78,8 @@ Reconstruction DLL, takes the variables out of Extra variables and puts your old
 - Files we wrote are there as they are: the path tracer
   (`source/gpu/shadps4/video_core/renderer_vulkan/rt/`), its shaders
   (`source/gpu/shadps4/video_core/host_shaders/rt_*.comp`), tests and tools.
-- Our changes to his files are one patch: `source/supermedo-1.9.8.6.patch`.
+- Our changes to his engine files are one patch: `source/supermedo-1.9.8.6.patch`.
+- Our changes to his launcher are one patch: `source/launcher-fork-1.9.8.6.patch`.
 
 Rebuild the exact pt2 tree:
 
@@ -100,7 +87,7 @@ Rebuild the exact pt2 tree:
 git clone --recursive --branch windows-v1.9.8.6 https://github.com/Supermedo/bloodborne_pc
 git clone https://github.com/Joaovitor404silva/bloodborne-pc-path-tracing
 cp -r bloodborne-pc-path-tracing/source/. bloodborne_pc/
-cd bloodborne_pc && git apply supermedo-1.9.8.6.patch
+cd bloodborne_pc && git apply supermedo-1.9.8.6.patch launcher-fork-1.9.8.6.patch
 ```
 
 Then build on Windows (MSYS2 CLANG64) as in his `packaging/windows/README.md`: `bash build.sh`
@@ -125,6 +112,11 @@ python tools/port_update.py package --rt pt2.3       # installer folder, GitHub 
 python tools/port_update.py test --rt pt2.3          # tools/test_installer.ps1 on the stock folder
 python tools/port_update.py release --rt pt2.3 --yes # tag, commit, push, GitHub release
 ```
+
+The full download: freeze the launcher (PyInstaller, as in his `packaging/windows`), then
+`python tools/make_full.py HIS_ZIP FORK_REPO PAYLOAD_BIN OUT_ZIP` puts his `Bloodborne-Windows.zip`,
+our launcher and the 4 engine files together and rewrites `bbport-files.json`. Its release tag is
+`windows-v<his version>-pt<N>` with the asset `Bloodborne-Windows.zip` (what the launcher updates from).
 
 Between `test` and `release`, play it: install the `dist` folder into a copy of the stock folder,
 start the game, press F9. Merge conflicts stop at `merge`: resolve, `git commit`, go on with `build`.

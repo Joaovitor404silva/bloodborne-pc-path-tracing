@@ -1,0 +1,556 @@
+diff --git a/launcher/bbport_lang.py b/launcher/bbport_lang.py
+index 626adfd..000c633 100644
+--- a/launcher/bbport_lang.py
++++ b/launcher/bbport_lang.py
+@@ -1250,6 +1250,7 @@ from bbport_lang_exit import TRANSLATIONS as EXIT_TRANSLATIONS  # noqa: E402
+ from bbport_lang_window import TRANSLATIONS as WINDOW_TRANSLATIONS  # noqa: E402
+ from bbport_lang_relay import TRANSLATIONS as RELAY_TRANSLATIONS  # noqa: E402
+ from bbport_lang_lod import TRANSLATIONS as LOD_TRANSLATIONS  # noqa: E402
++from bbport_lang_rt import TRANSLATIONS as RT_TRANSLATIONS  # noqa: E402
+ 
+ EXTRA_TRANSLATIONS = {
+     'zh': {
+@@ -1301,4 +1302,5 @@ def table(language):
+         _tables[language].update(WINDOW_TRANSLATIONS.get(language, {}))
+         _tables[language].update(RELAY_TRANSLATIONS.get(language, {}))
+         _tables[language].update(LOD_TRANSLATIONS.get(language, {}))
++        _tables[language].update(RT_TRANSLATIONS.get(language, {}))
+     return _tables[language]
+diff --git a/launcher/bbport_lang_rt.py b/launcher/bbport_lang_rt.py
+new file mode 100644
+index 0000000..8f92442
+--- /dev/null
++++ b/launcher/bbport_lang_rt.py
+@@ -0,0 +1,199 @@
++# SPDX-License-Identifier: GPL-2.0-or-later
++"""Localized texts of the path tracing fork's Path tracing section (Picture & performance, All graphics:
++path_tracing_section, RT_SLIDERS)."""
++
++KEYS = (
++    'Path tracing',
++    'Ray-traced moonlight, bounce light, shadows and reflections. Needs a GeForce RTX or Radeon RX 6000 or '
++    'newer. In game, F9 switches it off and on to compare (about 3 seconds while the exposure adjusts).',
++    'Bounce light',
++    'Light bouncing off walls and floors into the shadows.',
++    'Reflections',
++    'Traced reflections on water, puddles, glass and polished stone.',
++    'Shadows',
++    'How dark the traced shadows of the moon and lamps are.',
++    'Auto', 'Low', 'Medium', 'High', 'Custom',
++    'Changes apply at the next start of the game. Extra variables (Advanced > Diagnostics) still override '
++    'these, e.g. BB_RT_GI_STRENGTH=1.3.',
++)
++TEXTS = {
++    'en': KEYS,
++    'ru': (
++        'Трассировка пути',
++        'Трассированный лунный свет, отражённый свет, тени и отражения. Нужна GeForce RTX или Radeon RX 6000 '
++        'и новее. В игре F9 выключает и включает её для сравнения '
++        '(около 3 секунд, пока подстраивается экспозиция).',
++        'Отражённый свет',
++        'Свет, отражённый от стен и пола в тени.',
++        'Отражения',
++        'Трассированные отражения на воде, лужах, стекле и полированном камне.',
++        'Тени',
++        'Насколько темны трассированные тени от луны и фонарей.',
++        'Авто', 'Низко', 'Средне', 'Высоко', 'Своё',
++        'Изменения вступают в силу при следующем запуске игры. Доп. переменные (Дополнительно > Для '
++        'разработчика) по-прежнему важнее, напр. BB_RT_GI_STRENGTH=1.3.',
++    ),
++    'pt': (
++        'Path tracing',
++        'Luar, luz rebatida, sombras e reflexos com ray tracing. Precisa de uma GeForce RTX ou Radeon RX 6000 '
++        'ou mais nova. No jogo, F9 desliga e liga para comparar (cerca de '
++        '3 segundos enquanto a exposição se ajusta).',
++        'Luz rebatida',
++        'Luz que rebate nas paredes e no chão e chega às sombras.',
++        'Reflexos',
++        'Reflexos traçados na água, poças, vidro e pedra polida.',
++        'Sombras',
++        'O quão escuras são as sombras traçadas da lua e dos lampiões.',
++        'Auto', 'Baixo', 'Médio', 'Alto', 'Personalizado',
++        'As mudanças valem a partir do próximo início do jogo. Variáveis extras (Avançado > Diagnóstico) '
++        'continuam valendo por cima destas, ex. BB_RT_GI_STRENGTH=1.3.',
++    ),
++    'es': (
++        'Path tracing',
++        'Luz de luna, luz rebotada, sombras y reflejos con trazado de rayos. Necesita una GeForce RTX o Radeon '
++        'RX 6000 o más nueva. En el juego, F9 lo apaga y enciende para '
++        'comparar (unos 3 segundos mientras se ajusta la exposición).',
++        'Luz rebotada',
++        'Luz que rebota en paredes y suelos hacia las sombras.',
++        'Reflejos',
++        'Reflejos trazados en el agua, charcos, cristal y piedra pulida.',
++        'Sombras',
++        'Lo oscuras que son las sombras trazadas de la luna y las farolas.',
++        'Auto', 'Bajo', 'Medio', 'Alto', 'Personalizado',
++        'Los cambios se aplican en el próximo inicio del juego. Las variables extra (Avanzado > Diagnóstico) '
++        'siguen teniendo prioridad, p. ej. BB_RT_GI_STRENGTH=1.3.',
++    ),
++    'fr': (
++        'Path tracing',
++        'Clair de lune, lumière réfléchie, ombres et reflets en lancer de rayons. Nécessite une GeForce RTX ou '
++        'une Radeon RX 6000 ou plus récente. En jeu, F9 le coupe et le '
++        "rallume pour comparer (environ 3 secondes le temps que l'exposition s'ajuste).",
++        'Lumière réfléchie',
++        'La lumière renvoyée par les murs et les sols dans les ombres.',
++        'Reflets',
++        "Reflets tracés sur l'eau, les flaques, le verre et la pierre polie.",
++        'Ombres',
++        'La noirceur des ombres tracées de la lune et des lanternes.',
++        'Auto', 'Faible', 'Moyen', 'Élevé', 'Personnalisé',
++        'Les changements prennent effet au prochain lancement du jeu. Les variables supplémentaires (Avancé > '
++        'Diagnostic) restent prioritaires, p. ex. BB_RT_GI_STRENGTH=1.3.',
++    ),
++    'de': (
++        'Path Tracing',
++        'Raytracing für Mondlicht, indirektes Licht, Schatten und Spiegelungen. Braucht eine GeForce RTX oder '
++        'Radeon RX 6000 oder neuer. Im Spiel schaltet F9 es zum '
++        'Vergleich aus und an (etwa 3 Sekunden, bis sich die Belichtung anpasst).',
++        'Indirektes Licht',
++        'Licht, das von Wänden und Böden in die Schatten zurückgeworfen wird.',
++        'Spiegelungen',
++        'Berechnete Spiegelungen auf Wasser, Pfützen, Glas und poliertem Stein.',
++        'Schatten',
++        'Wie dunkel die berechneten Schatten von Mond und Laternen sind.',
++        'Auto', 'Niedrig', 'Mittel', 'Hoch', 'Eigene',
++        'Änderungen gelten ab dem nächsten Spielstart. Zusätzliche Variablen (Erweitert > Diagnose) haben '
++        'weiter Vorrang, z. B. BB_RT_GI_STRENGTH=1.3.',
++    ),
++    'it': (
++        'Path tracing',
++        'Luce lunare, luce riflessa, ombre e riflessi in ray tracing. Serve una GeForce RTX o Radeon RX 6000 o '
++        'più recente. In gioco, F9 lo spegne e lo riaccende per confrontare '
++        "(circa 3 secondi mentre l'esposizione si adatta).",
++        'Luce riflessa',
++        'La luce che rimbalza su muri e pavimenti fin dentro le ombre.',
++        'Riflessi',
++        "Riflessi tracciati su acqua, pozzanghere, vetro e pietra levigata.",
++        'Ombre',
++        'Quanto sono scure le ombre tracciate della luna e delle lanterne.',
++        'Auto', 'Basso', 'Medio', 'Alto', 'Personalizzato',
++        "Le modifiche valgono dal prossimo avvio del gioco. Le variabili extra (Avanzate > Diagnostica) hanno "
++        'ancora la precedenza, es. BB_RT_GI_STRENGTH=1.3.',
++    ),
++    'pl': (
++        'Path tracing',
++        'Śledzone promieniami światło księżyca, światło odbite, cienie i odbicia. Wymaga GeForce RTX lub Radeon '
++        'RX 6000 albo nowszej. W grze F9 wyłącza i włącza je dla '
++        'porównania (około 3 sekund, aż ekspozycja się dostosuje).',
++        'Światło odbite',
++        'Światło odbijane od ścian i podłóg w głąb cieni.',
++        'Odbicia',
++        'Śledzone odbicia na wodzie, kałużach, szkle i polerowanym kamieniu.',
++        'Cienie',
++        'Jak ciemne są śledzone cienie księżyca i latarni.',
++        'Auto', 'Niskie', 'Średnie', 'Wysokie', 'Własne',
++        'Zmiany działają od następnego uruchomienia gry. Dodatkowe zmienne (Zaawansowane > Diagnostyka) nadal '
++        'mają pierwszeństwo, np. BB_RT_GI_STRENGTH=1.3.',
++    ),
++    'tr': (
++        'Path tracing',
++        'Işın izlemeli ay ışığı, yansıyan ışık, gölgeler ve yansımalar. GeForce RTX veya Radeon RX 6000 ya da '
++        'daha yenisi gerekir. Oyunda F9 karşılaştırmak için '
++        'kapatıp açar (pozlama ayarlanırken yaklaşık 3 saniye).',
++        'Yansıyan ışık',
++        'Duvarlardan ve zeminden gölgelere yansıyan ışık.',
++        'Yansımalar',
++        'Su, su birikintileri, cam ve cilalı taş üzerinde izlenen yansımalar.',
++        'Gölgeler',
++        'Ayın ve fenerlerin izlenen gölgelerinin ne kadar koyu olduğu.',
++        'Otomatik', 'Düşük', 'Orta', 'Yüksek', 'Özel',
++        'Değişiklikler oyunun bir sonraki başlatılışında geçerli olur. Ek değişkenler (Gelişmiş > Tanılama) '
++        'yine önceliklidir, ör. BB_RT_GI_STRENGTH=1.3.',
++    ),
++    'ar': (
++        'تتبع المسار',
++        'ضوء القمر والضوء المرتد والظلال والانعكاسات بتتبع الأشعة. يحتاج GeForce RTX أو Radeon RX 6000 أو أحدث. '
++        'داخل اللعبة يوقفه F9 ويشغله للمقارنة (نحو 3 ثوانٍ ريثما يتكيف '
++        'التعريض).',
++        'الضوء المرتد',
++        'الضوء المرتد من الجدران والأرضيات إلى الظلال.',
++        'الانعكاسات',
++        'انعكاسات متتبعة على الماء والبرك والزجاج والحجر المصقول.',
++        'الظلال',
++        'مدى عتمة الظلال المتتبعة للقمر والفوانيس.',
++        'تلقائي', 'منخفض', 'متوسط', 'مرتفع', 'مخصص',
++        'تسري التغييرات عند التشغيل التالي للعبة. المتغيرات الإضافية (متقدم > التشخيص) تبقى لها الأولوية، '
++        'مثل BB_RT_GI_STRENGTH=1.3.',
++    ),
++    'zh': (
++        '路径追踪',
++        '光线追踪的月光、反弹光、阴影和反射。需要 GeForce RTX 或 Radeon RX 6000 及更新的显卡。'
++        '游戏中按 F9 可关闭/开启以作对比（曝光调整约需 3 秒）。',
++        '反弹光',
++        '从墙壁和地面反弹进阴影中的光。',
++        '反射',
++        '水面、水洼、玻璃和抛光石面上的追踪反射。',
++        '阴影',
++        '月亮和灯具的追踪阴影有多暗。',
++        '自动', '低', '中', '高', '自定义',
++        '更改在下次启动游戏时生效。额外变量（高级 > 诊断）仍优先于这些设置，例如 BB_RT_GI_STRENGTH=1.3。',
++    ),
++    'ja': (
++        'パストレーシング',
++        'レイトレーシングによる月光、反射光、影、映り込み。GeForce RTX または Radeon RX 6000 以降が必要です。'
++        'ゲーム中は F9 でオフ/オンを切り替えて比較できます'
++        '（露出の調整に約 3 秒）。',
++        '反射光',
++        '壁や床から影の中へ跳ね返る光。',
++        '映り込み',
++        '水面、水たまり、ガラス、磨かれた石へのトレースされた映り込み。',
++        '影',
++        '月とランプのトレースされた影の暗さ。',
++        '自動', '低', '中', '高', 'カスタム',
++        '変更は次回のゲーム起動から反映されます。追加の変数（詳細 > 診断）が引き続き優先されます。'
++        '例: BB_RT_GI_STRENGTH=1.3。',
++    ),
++    'ko': (
++        '패스 트레이싱',
++        '레이 트레이싱 달빛, 반사광, 그림자, 반사. GeForce RTX 또는 Radeon RX 6000 이상이 필요합니다. '
++        '게임 중 F9로 끄고 켜서 비교할 수 있습니다(노출 조정에 약 3초).',
++        '반사광',
++        '벽과 바닥에서 그림자 속으로 튕겨 들어오는 빛.',
++        '반사',
++        '물, 웅덩이, 유리, 광택 있는 돌에 추적된 반사.',
++        '그림자',
++        '달과 등불의 추적된 그림자가 얼마나 어두운지.',
++        '자동', '낮음', '중간', '높음', '사용자 지정',
++        '변경 사항은 다음 게임 실행부터 적용됩니다. 추가 변수(고급 > 진단)가 여전히 우선합니다. '
++        '예: BB_RT_GI_STRENGTH=1.3.',
++    ),
++}
++TRANSLATIONS = {language: dict(zip(KEYS, texts, strict=True)) for language, texts in TEXTS.items()}
+diff --git a/launcher/bbport_launcher_win.py b/launcher/bbport_launcher_win.py
+index 7c6e90c..30c44d8 100644
+--- a/launcher/bbport_launcher_win.py
++++ b/launcher/bbport_launcher_win.py
+@@ -47,6 +47,17 @@ VERSION = '1.9.8.6'
+ # offered as its update.
+ BETA = 0
+ VERSION_TEXT = f'{VERSION} beta {BETA}' if BETA else VERSION
++# Path tracing fork (github.com/Joaovitor404silva/bloodborne-pc-path-tracing) of SuperMedo's port: its release
++# tags are windows-v<VERSION>-<RT_VERSION>, and updates come from that repository, so an update never puts back
++# an engine without path tracing.
++RT_VERSION = 'pt2.3'
++RT_REPO = 'Joaovitor404silva/bloodborne-pc-path-tracing'
++# Path tracing on by default (the variables the pt2 installer wrote into Extra variables); Extra variables
++# still override each one, e.g. BB_RT=0.
++RT_ENV = {'BB_RT': '1', 'BB_RT_DIRECT': '1', 'BB_RT_GI': '1', 'BB_RT_COMPACT': '0', 'BB_RT_REFIT_BUDGET': '0',
++          'BB_RT_FILL_LIGHT': 'off', 'BB_HDR_GAMMA': '0', 'BB_RT_FILL_ENCLOSED': '0.1', 'BB_RT_SKIN_ALPHA': '1',
++          'BB_RT_FX_FOG': '0', 'BB_RT_FX_FOG_G': '0', 'BB_RT_GI_LAST_BOUNCE_CACHE': '1', 'BB_RT_GI_SER': '1',
++          'BB_RT_GI_PIPELINE': '1', 'BB_RT_RESTIR_GI': '1', 'BB_RT_DLSS_RR': '0', 'BB_RT_KEEP_GI': '1'}
+ BETA_PAGE = 'https://github.com/Bloodborne-Port-supermedo/bbport-supermedo/releases'
+ # The port's Discord application (discord.com/developers: its Application ID; an art asset named
+ # "bloodborne" is the picture). Empty: no Discord status, and its setting is not shown.
+@@ -87,11 +98,11 @@ def saves_user_dir(s):
+     its own characters (run.py COOP_SAVES), apart from the normal ones it would change."""
+     user = Path(s.get('user_dir') or DATA_DIR / 'user')
+     return user / saves.COOP_SAVES if plays_seamless(s) else user
+-RELEASES_API = 'https://api.github.com/repos/Supermedo/bloodborne_pc/releases/latest'
+-RELEASES_PAGE = 'https://github.com/Supermedo/bloodborne_pc/releases/latest'
++RELEASES_API = f'https://api.github.com/repos/{RT_REPO}/releases/latest'
++RELEASES_PAGE = f'https://github.com/{RT_REPO}/releases/latest'
+ # The community site (install guide, FAQ, forum), linked from the side bar.
+ COMMUNITY_SITE = 'https://bbport.de/'
+-RELEASES_LIST_API = 'https://api.github.com/repos/Supermedo/bloodborne_pc/releases?per_page=100'
++RELEASES_LIST_API = f'https://api.github.com/repos/{RT_REPO}/releases?per_page=100'
+ # The betas (pre-releases v<VERSION>-beta.<N>): a beta asks here too, for the next one (update_to_offer).
+ BETAS_API = 'https://api.github.com/repos/emurphy04/bloodborne_pc/releases?per_page=30'
+ # The oldest version Advanced > Other versions offers: older ones cannot read today's settings. (A copy of
+@@ -420,6 +431,9 @@ INI_DEFAULTS = {'upscaler': 'fsr3', 'preset': '1', 'sharpen': '1', 'sharpness':
+                 **{key: '1' if on else '0' for key, _t, on in EFFECTS + EXTRAS + CHEATS + TWEAKS}}
+ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / 'CUSA03173'), 'user_dir': '', 'cache_dir': '',
+                 'dlc_dir': '',
++                # Path tracing fork: Picture & performance > Path tracing (rt_environment).
++                'rt_on': True, 'rt_gi': '1.0', 'rt_reflect': '1.0', 'rt_shadow': '0.75',
++                'rt_gi_mode': 'auto', 'rt_reflect_mode': 'auto', 'rt_shadow_mode': 'auto',
+                 'mods_dir': '', 'mods_enabled': True, 'patches_dir': '', 'language': '1',
+                 'voice_language': 'auto',
+                 'player_name': '', 'fullscreen': False, 'exclusive_fullscreen': False,
+@@ -1397,6 +1411,7 @@ def game_environment(s, graphics=None):
+                       ('vk_validation', 'BB_VK_VALIDATION')):
+         if s[key]:
+             env[name] = '1'
++    env.update(rt_environment(s))
+     for item in str(s['extra_env']).split():
+         if '=' in item:
+             key, value = item.split('=', 1)
+@@ -1984,6 +1999,82 @@ class Launcher(bbport_setup.SetupMixin, bbport_help.HelpMixin, bbport_search.Sea
+         self.index_entry(widget, title, hint, key or self.setting_key_of(widget), mark=label)
+         return widget
+ 
++    def path_tracing_section(self, f):
++        """Path tracing fork: the switch and strengths (rt_environment), from the next start."""
++        ttk = self.ttk
++        self.section(f, _('Path tracing'))
++        on = self.check(f, 'rt_on', 'app', _('Path tracing'),
++                        _('Ray-traced moonlight, bounce light, shadows and reflections. Needs a GeForce RTX or '
++                          'Radeon RX 6000 or newer. In game, F9 switches it off and on to compare (about 3 seconds '
++                          'while the exposure adjusts).'))
++        widgets = []
++        names = {mode: _(mode.capitalize()) for mode in RT_MODES}
++        for key, _name, title, lo, hi, hint in RT_SLIDERS:
++            holder = ttk.Frame(f)
++            var = self.var(key, 'app')
++            mode_var = self.var(f'{key}_mode', 'app')
++            preset = ttk.Combobox(holder, state='readonly', width=13, values=[names[m] for m in RT_MODES])
++            preset.pack(side='left', padx=(0, 10))
++            scale = ttk.Scale(holder, from_=lo, to=hi, variable=var, length=260)
++            scale.pack(side='left')
++            value = ttk.Label(holder, width=5)
++            value.pack(side='left', padx=10)
++            busy = []  # a preset moving the slider is not a hand-made (custom) change
++
++            def show(*_a, var=var, value=value, mode_var=mode_var, preset=preset, key=key, busy=busy):
++                try:
++                    value.configure(text=f'{float(var.get()):.2f}')
++                except (ValueError, self.tk.TclError):
++                    pass
++                if not busy and mode_var.get() != 'custom' and preset.winfo_exists():
++                    current = rt_strength({key: var.get(), f'{key}_mode': mode_var.get()}, key)
++                    try:
++                        moved = abs(float(var.get()) - current) > 0.005
++                    except (ValueError, self.tk.TclError):
++                        moved = False
++                    if moved:
++                        mode_var.set('custom')
++
++            def pick(*_a, var=var, mode_var=mode_var, preset=preset, key=key, busy=busy):
++                mode = RT_MODES[preset.current()] if preset.current() >= 0 else 'auto'
++                busy.append(1)
++                try:
++                    mode_var.set(mode)
++                    if mode != 'custom':
++                        var.set(f'{rt_strength({f"{key}_mode": mode}, key):.2f}')
++                finally:
++                    busy.clear()
++
++            def sync(*_a, mode_var=mode_var, preset=preset):
++                mode = mode_var.get() if mode_var.get() in RT_MODES else 'auto'
++                if preset.winfo_exists():
++                    preset.current(RT_MODES.index(mode))
++            preset.bind('<<ComboboxSelected>>', pick)
++            mode_var.trace_add('write', sync)
++            sync()
++            if mode_var.get() != 'custom':  # the slider shows what the preset uses
++                busy.append(1)
++                var.set(f'{rt_strength({f"{key}_mode": mode_var.get()}, key):.2f}')
++                busy.clear()
++            var.trace_add('write', show)
++            show()
++            self.row(f, _(title), holder, _(hint))
++            widgets += [preset, scale]
++
++        def refresh(*_a):
++            for widget in widgets:
++                if widget.winfo_exists():
++                    on = self.vars['rt_on'].get()
++                    if isinstance(widget, ttk.Combobox):
++                        widget.configure(state='readonly' if on else 'disabled')
++                    else:
++                        widget.state(['!disabled' if on else 'disabled'])
++        self.vars['rt_on'].trace_add('write', refresh)
++        refresh()
++        self.note(f, _('Changes apply at the next start of the game. Extra variables (Advanced > Diagnostics) '
++                       'still override these, e.g. BB_RT_GI_STRENGTH=1.3.'), top=6)
++        return on
++
+     def check(self, parent, key, store, title, hint=None):
+         ttk = self.ttk
+         r = self.next_row(parent)
+@@ -2140,6 +2231,7 @@ class Launcher(bbport_setup.SetupMixin, bbport_help.HelpMixin, bbport_search.Sea
+         tk.Label(words, text='BLOODBORNE', bg=BG, fg=theme.TEXT_STRONG, font=(theme.HEAD_BOLD, 14)).pack(anchor='w')
+         tk.Label(words, text='PC PORT', bg=BG, fg=GOLD, font=(theme.HEAD, 8)).pack(anchor='w')
+         self.byline = tk.Label(side, text=_('by Super Medo') + f'  ·  v{VERSION_TEXT}' +
++                               f'\nPath tracing {RT_VERSION} (fork)' +
+                                ('\n' + _('co-op test build') if COOP_TEST else ''),
+                                bg=BG, fg=MUTED, justify='left', font=(theme.BODY, 9))
+         self.byline_pads = ((px(2), px(8)), (0, px(4)))  # its gaps under the full head and the narrower ones
+@@ -2892,6 +2984,7 @@ class Launcher(bbport_setup.SetupMixin, bbport_help.HelpMixin, bbport_search.Sea
+         self.version_warning(f)
+         self.link_row(f, _('Fullscreen, HDR and the taste effects are on Picture & performance.'),
+                       'picture')
++        self.path_tracing_section(f)
+         self.section(f, _('Upscaling', 'Апскейлинг'), top=4)
+         self.row(f, _('Upscaler', 'Апскейлер'), self.choice(f, 'upscaler', 'ini', UPSCALERS),
+                  _("Temporal upscaling with the game's own motion vectors. FSR 4 needs its files (below) and "
+@@ -7056,14 +7149,64 @@ def version_tuple(text):
+     return tuple(int(number) for number in re.findall(r'\d+', text or ''))
+ 
+ 
++RT_SLIDERS = (('rt_gi', 'BB_RT_GI_STRENGTH', 'Bounce light', 0.0, 2.0,
++                'Light bouncing off walls and floors into the shadows.'),
++               ('rt_reflect', 'BB_RT_REFLECT_STRENGTH', 'Reflections', 0.0, 2.0,
++                'Traced reflections on water, puddles, glass and polished stone.'),
++               ('rt_shadow', 'BB_RT_SHADOW_STRENGTH', 'Shadows', 0.0, 1.5,
++                'How dark the traced shadows of the moon and lamps are.'))
++# Each strength's presets (setting <key>_mode); 'auto' is the fork's recommended value (APP_DEFAULTS), which a
++# later version may retune, and 'custom' is the slider.
++RT_PRESETS = {'rt_gi': {'low': 0.6, 'medium': 1.0, 'high': 1.4},
++              'rt_reflect': {'low': 0.5, 'medium': 1.0, 'high': 1.5},
++              'rt_shadow': {'low': 0.5, 'medium': 0.75, 'high': 1.0}}
++RT_MODES = ('auto', 'low', 'medium', 'high', 'custom')
++
++
++def rt_strength(s, key):
++    """The strength a start uses for one Path tracing slider: its preset, or the slider for 'custom'."""
++    _key, _name, _title, lo, hi, _hint = next(row for row in RT_SLIDERS if row[0] == key)
++    mode = s.get(f'{key}_mode', 'auto')
++    try:
++        if mode == 'custom':
++            return min(hi, max(lo, float(s.get(key, APP_DEFAULTS[key]))))
++    except (TypeError, ValueError):
++        pass
++    return RT_PRESETS[key].get(mode, float(APP_DEFAULTS[key]))
++
++
++def rt_environment(s):
++    """The path tracing variables of a start: RT_ENV with the Path tracing section's strengths, or only
++    BB_RT=0 with it switched off. Extra variables still override each one (game_environment)."""
++    if not s.get('rt_on', True):
++        return {'BB_RT': '0'}
++    env = dict(RT_ENV)
++    for key, name, *_rest in RT_SLIDERS:
++        env[name] = f'{rt_strength(s, key):.2f}'
++    return env
++
++
++FORK_TAG = re.compile(r'windows-v(\d+(?:\.\d+)*)-pt(\d+(?:\.\d+)*)')
++
++
+ def latest_release():
+-    """(version, zip URL, page URL) of the newest GitHub release."""
+-    request = urllib.request.Request(RELEASES_API, headers={'Accept': 'application/vnd.github+json',
+-                                                            'User-Agent': 'bbport-launcher'})
++    """(version, zip URL, page URL) of the newest full release of the path tracing fork: a tag
++    windows-v<VERSION>-pt<N> with a game package. The repository also holds the mod-only releases (pt2.3,
++    ...: no Bloodborne.exe), which never count. (None, None, None) when there is none."""
++    request = urllib.request.Request(RELEASES_LIST_API, headers={'Accept': 'application/vnd.github+json',
++                                                                 'User-Agent': 'bbport-launcher'})
+     with bbport_tls.urlopen(request, timeout=15) as response:
+-        release = json.load(response)
+-    version = '.'.join(re.findall(r'\d+', release['tag_name']))
+-    return version, game_zip(release), release.get('html_url') or RELEASES_PAGE
++        releases = json.load(response)
++    best = None
++    for release in releases:
++        found = FORK_TAG.fullmatch(release.get('tag_name', ''))
++        if release.get('draft') or release.get('prerelease') or not found:
++            continue
++        url = game_zip(release)
++        version = f'{found[1]}-pt{found[2]}'
++        if url and (best is None or version_tuple(version) > version_tuple(best[0])):
++            best = (version, url, release.get('html_url') or RELEASES_PAGE)
++    return best or (None, None, None)
+ 
+ 
+ def newer_beta():
+@@ -7095,7 +7238,7 @@ def update_to_offer():
+     failure = None
+     try:
+         version, url, page = latest_release()
+-        newer = version_tuple(version) > version_tuple(VERSION)
++        newer = version is not None and version_tuple(version) > version_tuple(f'{VERSION}-{RT_VERSION}')
+         if newer or (BETA and version_tuple(version) == version_tuple(VERSION)):
+             return version, url, page
+     except Exception as error:
+diff --git a/launcher/bbport_setup.py b/launcher/bbport_setup.py
+index 5949ecb..dee46a9 100644
+--- a/launcher/bbport_setup.py
++++ b/launcher/bbport_setup.py
+@@ -1807,6 +1807,8 @@ class SetupMixin:
+                                  'the in-game menu (Insert or L3+R3) changes the same values.'))
+         card = ttk.Frame(f, style='Card.TFrame', padding=(px(22), px(16)))
+         card.grid(row=self.next_row(f), column=0, columnspan=2, sticky='we', pady=(px(10), 0))
++        if hasattr(self, 'path_tracing_section'):  # path tracing fork: under the card, before the rest
++            self.path_tracing_section(f)
+         body = tk.Frame(card, bg=theme.CARD)
+         body.pack(fill='both', expand=True)
+         head = tk.Frame(body, bg=theme.CARD)
+diff --git a/tests/test_rt_fork_launcher.py b/tests/test_rt_fork_launcher.py
+new file mode 100644
+index 0000000..92e282b
+--- /dev/null
++++ b/tests/test_rt_fork_launcher.py
+@@ -0,0 +1,80 @@
++"""The path tracing fork's launcher: path tracing on by default (Extra variables still override it), updates from
++the fork's repository only for a newer fork release, strength presets (auto by default)."""
++from paths import ROOT
++import sys
++import unittest
++from unittest import mock
++
++sys.path.insert(0, str(ROOT / 'launcher'))
++sys.path.insert(0, str(ROOT / 'scripts'))
++import bbport_launcher_win as L  # noqa: E402
++
++
++def release(tag):
++    return {'tag_name': tag, 'html_url': 'https://example.invalid/' + tag,
++            'assets': [{'name': 'Bloodborne-Windows.zip', 'browser_download_url': 'https://example.invalid/zip'}]}
++
++
++class RtForkLauncher(unittest.TestCase):
++    def test_path_tracing_is_on_by_default(self):
++        with mock.patch.dict('os.environ', {}, clear=True):
++            env = L.game_environment(dict(L.APP_DEFAULTS), L.INI_DEFAULTS)
++        for key, value in L.RT_ENV.items():
++            self.assertEqual(env[key], value, key)
++
++    def test_extra_variables_override_the_defaults(self):
++        settings = {**L.APP_DEFAULTS, 'extra_env': 'BB_RT=0 BB_RT_GI_STRENGTH=1.3'}
++        with mock.patch.dict('os.environ', {}, clear=True):
++            env = L.game_environment(settings, L.INI_DEFAULTS)
++        self.assertEqual((env['BB_RT'], env['BB_RT_GI_STRENGTH']), ('0', '1.3'))
++
++    def test_presets(self):
++        def strengths(**modes):
++            settings = {**L.APP_DEFAULTS, 'rt_gi': '1.9', **{f'{k}_mode': v for k, v in modes.items()}}
++            with mock.patch.dict('os.environ', {}, clear=True):
++                env = L.game_environment(settings, L.INI_DEFAULTS)
++            return env['BB_RT_GI_STRENGTH'], env['BB_RT_REFLECT_STRENGTH'], env['BB_RT_SHADOW_STRENGTH']
++        self.assertEqual(strengths(), ('1.00', '1.00', '0.75'))  # auto by default; the slider is ignored
++        self.assertEqual(strengths(rt_gi='low', rt_reflect='high', rt_shadow='medium'), ('0.60', '1.50', '0.75'))
++        self.assertEqual(strengths(rt_gi='custom', rt_shadow='nonsense'), ('1.90', '1.00', '0.75'))
++
++    def test_path_tracing_section_settings(self):
++        settings = {**L.APP_DEFAULTS, 'rt_gi': '1.5', 'rt_reflect': '0.4', 'rt_shadow': '9',
++                    'rt_gi_mode': 'custom', 'rt_reflect_mode': 'custom', 'rt_shadow_mode': 'custom'}
++        with mock.patch.dict('os.environ', {}, clear=True):
++            env = L.game_environment(settings, L.INI_DEFAULTS)
++        self.assertEqual((env['BB_RT'], env['BB_RT_GI_STRENGTH'], env['BB_RT_REFLECT_STRENGTH'],
++                          env['BB_RT_SHADOW_STRENGTH']), ('1', '1.50', '0.40', '1.50'))  # 9 kept to the range
++        with mock.patch.dict('os.environ', {}, clear=True):
++            env = L.game_environment({**L.APP_DEFAULTS, 'rt_on': False}, L.INI_DEFAULTS)
++        self.assertEqual(env['BB_RT'], '0')
++        self.assertNotIn('BB_RT_GI', env)
++
++    def test_updates_come_from_the_fork(self):
++        for url in (L.RELEASES_API, L.RELEASES_PAGE, L.RELEASES_LIST_API):
++            self.assertIn(L.RT_REPO, url)
++
++    def offer(self, releases):
++        with mock.patch.object(L.bbport_tls, 'urlopen') as urlopen, \
++                mock.patch.object(L.json, 'load', return_value=releases):
++            urlopen.return_value.__enter__.return_value = None
++            return L.update_to_offer()
++
++    def test_only_a_newer_fork_release_is_offered(self):
++        own = f'windows-v{L.VERSION}-{L.RT_VERSION}'
++        for tag, offered in ((own, False), (f'windows-v{L.VERSION}-pt9.0', True), ('windows-v9.0.0.0-pt2.0', True)):
++            self.assertEqual(self.offer([release(tag)]) is not None, offered, tag)
++
++    def test_mod_only_releases_are_never_offered(self):
++        # 2026-11-14: the repository's latest release "pt2.3" (the 4-file mod zip) read as version 2.3, was
++        # offered as an update, and its download had no Bloodborne.exe.
++        mod = {'tag_name': 'pt2.3', 'html_url': 'x', 'assets': [
++            {'name': 'Bloodborne-PC-Path-Tracing-pt2.3.zip', 'browser_download_url': 'https://example.invalid/mod'}]}
++        self.assertIsNone(self.offer([mod]))
++        newer = release(f'windows-v{L.VERSION}-pt9.0')
++        self.assertEqual(self.offer([mod, newer])[1], 'https://example.invalid/zip')
++
++
++
++if __name__ == '__main__':
++    unittest.main()
