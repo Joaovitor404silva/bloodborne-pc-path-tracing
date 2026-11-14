@@ -32,15 +32,15 @@ WHAT IS DIFFERENT FROM SUPERMEDO'S 1.9.8.6
 - bin\bb-probe.exe: the engine with the path tracer. bin\bbport_dlss.dll: the DLSS
   bridge with Ray Reconstruction; bin\nvngx_dlssd.dll: NVIDIA's Ray Reconstruction;
   bin\libc++.dll: a newer C++ runtime the engine needs.
-- The launcher: path tracing variables on by default; its updates come from the
-  path tracing fork (so an update never removes path tracing); FSR 4 / 4.1 is not
-  picked automatically (path tracing does not run under FSR 4.1): DLSS on GeForce
-  RTX, else FSR 3.1.
+- The launcher: a Path tracing section (Picture & performance) with the switch
+  and the bounce light, reflection and shadow presets; its updates come from the
+  path tracing fork (so an update never removes path tracing).
 
 SETTINGS
-- Turn path tracing off: Advanced > Diagnostics > Extra variables: BB_RT=0
-- Tweaks: other BB_RT_* variables in the same field, e.g. BB_RT_GI_STRENGTH=1.3
-- Upscaler: keep DLSS or FSR 3.1. Frame generation works (DLSS FG, FSR 3.1 FG).
+- Picture & performance > Path tracing: on/off, then bounce light, reflections and
+  shadows, each Auto (recommended), Low, Medium, High or Custom (the slider).
+- More tweaks: BB_RT_* variables in Advanced > Diagnostics > Extra variables.
+- Upscalers: DLSS, FSR 3.1 and FSR 4.1 work, with frame generation too.
 - Seamless co-op runs its own engine (bb-probe-seamless.exe) without path tracing.
 
 SOURCE
